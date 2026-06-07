@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Download-PaperPdf-MarLous</title>
+    <link rel="icon" href="/assets/MarLous.png" />
+    <link rel="stylesheet" href="/assets/style.css?v=20260607-toolbar-one-line" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <img class="mark" src="/assets/MarLous.png" alt="MarLous" />
+          <div>
+            <h1>Download-PaperPdf-MarLous</h1>
+            <p>检索、入库、按库下载</p>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>知名 OA 出版商</h2>
+          <div id="publisherList" class="publisher-list"></div>
+        </div>
+        <div class="log-panel sidebar-log">
+          <div class="log-heading">
+            <h2>任务日志</h2>
+            <div id="progressText" class="progress-text">进度：0/0</div>
+          </div>
+          <pre id="logs"></pre>
+        </div>
+      </aside>
+
+      <main class="main">
+        <section class="toolbar toolbar-search">
+          <div class="keyword-grid">
+            <div class="field">
+              <label>关键词 1</label>
+              <input id="kw1" placeholder="glioma" />
+            </div>
+            <div class="field">
+              <label>关键词 2</label>
+              <input id="kw2" placeholder="immunotherapy" />
+            </div>
+            <div class="field">
+              <label>关键词 3</label>
+              <input id="kw3" placeholder="prognosis" />
+            </div>
+            <div class="field title-field">
+              <label>文章名</label>
+              <input id="titleQuery" placeholder="输入完整或部分文章名" />
+            </div>
+          </div>
+          <div class="option-row repo-row">
+            <div class="field small">
+              <label>显示篇数</label>
+              <select id="maxPapers">
+                <option value="100" selected>100</option>
+                <option value="200">200</option>
+                <option value="300">300</option>
+                <option value="400">400</option>
+                <option value="500">500</option>
+                <option value="750">750</option>
+                <option value="1000">1000</option>
+              </select>
+            </div>
+            <div class="field repo-field">
+              <label>仓库</label>
+              <select id="repoSelect">
+                <option value="search">检索记录</option>
+                <option value="repo1">仓库 1</option>
+                <option value="repo2">仓库 2</option>
+                <option value="repo3">仓库 3</option>
+              </select>
+            </div>
+            <div class="field handoff-field">
+              <label>验证等待</label>
+              <select id="handoffWaitSelect">
+                <option value="0">0秒</option>
+                <option value="10" selected>10秒</option>
+                <option value="20">20秒</option>
+                <option value="30">30秒</option>
+                <option value="60">1分钟</option>
+              </select>
+            </div>
+            <div class="action-stack repo-actions">
+              <button id="searchBtn" class="primary">关键词检索</button>
+              <button id="titleSearchBtn" class="primary">文章名检索</button>
+              <button id="addRepoBtn" disabled hidden>添加勾选</button>
+              <button id="loadRepoBtn">项目</button>
+              <button id="downloadRepoBtn">下载仓库</button>
+              <button id="openRepoFolderBtn">仓库文件</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="status-band">
+          <div>
+            <span class="label">状态</span>
+            <strong id="statusText">待检索</strong>
+          </div>
+          <div>
+            <span class="label">候选/仓库</span>
+            <strong id="candidateText">0</strong>
+          </div>
+          <div>
+            <span class="label">已下载</span>
+            <strong id="downloadedText">0</strong>
+          </div>
+          <div>
+            <span class="label">失败</span>
+            <strong id="failedText">0</strong>
+          </div>
+          <div>
+            <span class="label">分区源</span>
+            <strong id="quartileText">读取中</strong>
+          </div>
+          <button id="reloadQuartileBtn">重载分区</button>
+          <button id="openFolderBtn">打开目录</button>
+          <button id="pauseDownloadBtn" hidden>暂停下载</button>
+        </section>
+
+        <section class="content">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>序号</th>
+                  <th><button class="th-sort" id="sortRelevanceBtn" type="button">文献名称</button></th>
+                  <th>作者</th>
+                  <th>摘要</th>
+                  <th><button class="th-sort" id="sortDateBtn" type="button">发表时间</button></th>
+                  <th><button class="th-sort" id="sortRelevanceValueBtn" type="button">关联度</button></th>
+                  <th>所在仓库</th>
+                  <th>SCI 分区</th>
+                  <th><button class="th-sort" id="journalFilterBtn" type="button">期刊</button></th>
+                  <th><button class="th-sort" id="pdfFilterBtn" type="button">PDF</button></th>
+                  <th><button class="th-action" id="addAllRepoBtn" type="button">全部加入</button></th>
+                </tr>
+              </thead>
+              <tbody id="paperRows"></tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div id="repoPicker" class="repo-picker" hidden>
+      <div class="repo-picker-title">加入到仓库</div>
+      <button type="button" data-picker-repo="repo1">仓库 1</button>
+      <button type="button" data-picker-repo="repo2">仓库 2</button>
+      <button type="button" data-picker-repo="repo3">仓库 3</button>
+    </div>
+    <div id="projectPicker" class="repo-picker project-picker" hidden>
+      <div class="repo-picker-title" id="projectPickerTitle">项目</div>
+      <button type="button" id="newProjectBtn">新建项目文件夹</button>
+      <button type="button" id="selectProjectBtn">选择项目</button>
+    </div>
+    <div id="pdfFilterPicker" class="repo-picker pdf-filter-picker" hidden>
+      <div class="repo-picker-title">PDF筛选</div>
+      <button type="button" data-pdf-filter="local">有本地文件</button>
+      <button type="button" data-pdf-filter="source">有源</button>
+      <button type="button" data-pdf-filter="none">无源</button>
+      <button type="button" data-pdf-filter="all">显示全部</button>
+    </div>
+    <div id="journalFilterPicker" class="repo-picker journal-filter-picker" hidden>
+      <div class="repo-picker-title">期刊筛选</div>
+      <div id="journalFilterOptions"></div>
+    </div>
+    <div id="sortPicker" class="repo-picker" hidden>
+      <div class="repo-picker-title" id="sortPickerTitle">排序</div>
+      <button type="button" data-sort-direction="asc">正序</button>
+      <button type="button" data-sort-direction="desc">倒序</button>
+    </div>
+    <script src="/assets/app.js?v=20260607-toolbar-one-line"></script>
+  </body>
+</html>
