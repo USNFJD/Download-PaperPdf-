@@ -14,6 +14,7 @@
   sortDirections: { relevance: "desc", date: "desc" },
   pdfFilter: "all",
   journalFilter: "all",
+  quartileFilter: "all",
   sortPickerField: "relevance",
   pickerPaperKey: "",
   pickerAction: "add",
@@ -150,6 +151,17 @@ function applyPdfFilter(papers) {
 function applyJournalFilter(papers) {
   if (state.journalFilter === "all") return papers;
   return papers.filter((paper) => String(paper.journal || "未记录") === state.journalFilter);
+}
+
+function paperQuartile(paper) {
+  const match = String(paper.sci_quartile || "").toUpperCase().match(/Q[1-4]/);
+  return match ? match[0] : "";
+}
+
+function applyQuartileFilter(papers) {
+  if (state.quartileFilter === "all") return papers;
+  if (state.quartileFilter === "other") return papers.filter((paper) => !paperQuartile(paper));
+  return papers.filter((paper) => paperQuartile(paper) === state.quartileFilter);
 }
 
 function sortPapers(papers, sortMode = state.sortMode) {
@@ -364,7 +376,7 @@ function renderPapers(papers, mode = "search") {
   state.mode = mode;
   state.renderSourcePapers = [...papers];
   const sortedPapers = sortPapers(papers);
-  state.currentPapers = applyJournalFilter(applyPdfFilter(sortedPapers));
+  state.currentPapers = applyJournalFilter(applyQuartileFilter(applyPdfFilter(sortedPapers)));
   const renderedPapers = state.currentPapers;
   $("paperRows").innerHTML = renderedPapers
     .map((paper, index) => {
@@ -506,7 +518,7 @@ function openPdfFilterPicker(anchor) {
 function openJournalFilterPicker(anchor) {
   const picker = $("journalFilterPicker");
   const host = $("journalFilterOptions");
-  const papers = applyPdfFilter(state.renderSourcePapers.length ? state.renderSourcePapers : state.searchPapers);
+  const papers = applyQuartileFilter(applyPdfFilter(state.renderSourcePapers.length ? state.renderSourcePapers : state.searchPapers));
   const counts = new Map();
   papers.forEach((paper) => {
     const journal = String(paper.journal || "未记录");
@@ -530,8 +542,38 @@ function openJournalFilterPicker(anchor) {
   picker.style.top = `${top}px`;
 }
 
+function openQuartileFilterPicker(anchor) {
+  const picker = $("quartileFilterPicker");
+  const papers = applyJournalFilter(applyPdfFilter(state.renderSourcePapers.length ? state.renderSourcePapers : state.searchPapers));
+  const counts = { Q1: 0, Q2: 0, Q3: 0, Q4: 0, other: 0, all: papers.length };
+  papers.forEach((paper) => {
+    const quartile = paperQuartile(paper);
+    if (quartile && Object.prototype.hasOwnProperty.call(counts, quartile)) {
+      counts[quartile] += 1;
+    } else {
+      counts.other += 1;
+    }
+  });
+  picker.querySelectorAll("[data-quartile-filter]").forEach((button) => {
+    const key = button.dataset.quartileFilter;
+    button.textContent = key === "all" ? `显示全部 (${counts.all})` : `${key === "other" ? "其他" : key} (${counts[key] || 0})`;
+  });
+  picker.hidden = false;
+  const rect = anchor.getBoundingClientRect();
+  const width = 168;
+  const left = Math.max(12, Math.min(window.innerWidth - width - 12, rect.right - width));
+  const top = Math.max(12, Math.min(window.innerHeight - 204, rect.bottom + 6));
+  picker.style.left = `${left}px`;
+  picker.style.top = `${top}px`;
+}
+
 function closeJournalFilterPicker() {
   const picker = $("journalFilterPicker");
+  if (picker) picker.hidden = true;
+}
+
+function closeQuartileFilterPicker() {
+  const picker = $("quartileFilterPicker");
   if (picker) picker.hidden = true;
 }
 
@@ -549,6 +591,12 @@ function setPdfFilter(filter) {
 function setJournalFilter(filter) {
   state.journalFilter = filter || "all";
   closeJournalFilterPicker();
+  renderPapers(state.mode === "repo" ? state.renderSourcePapers : state.searchPapers, state.mode);
+}
+
+function setQuartileFilter(filter) {
+  state.quartileFilter = ["Q1", "Q2", "Q3", "Q4", "other", "all"].includes(filter) ? filter : "all";
+  closeQuartileFilterPicker();
   renderPapers(state.mode === "repo" ? state.renderSourcePapers : state.searchPapers, state.mode);
 }
 
@@ -804,9 +852,9 @@ async function addAllSearchToRepository(repoId) {
     alert("请选择仓库 1、2 或 3。");
     return;
   }
-  const paperIds = applyJournalFilter(applyPdfFilter(sortPapers(state.searchPapers))).map((paper) => normalizedPaperKey(paper)).filter(Boolean);
+  const paperIds = applyJournalFilter(applyQuartileFilter(applyPdfFilter(sortPapers(state.searchPapers)))).map((paper) => normalizedPaperKey(paper)).filter(Boolean);
   if (!paperIds.length) {
-    alert("当前 PDF 筛选下没有可加入的文献。");
+    alert("当前筛选下没有可加入的文献。");
     return;
   }
   const result = await api(`/api/repositories/${repoId}/add`, {
@@ -1149,6 +1197,7 @@ $("sortDateBtn").addEventListener("click", (event) => openSortPicker("date", eve
 $("sortRelevanceValueBtn").addEventListener("click", (event) => openSortPicker("relevance", event.currentTarget));
 $("pdfFilterBtn").addEventListener("click", (event) => openPdfFilterPicker(event.currentTarget));
 $("journalFilterBtn").addEventListener("click", (event) => openJournalFilterPicker(event.currentTarget));
+$("quartileFilterBtn").addEventListener("click", (event) => openQuartileFilterPicker(event.currentTarget));
 $("addAllRepoBtn").addEventListener("click", (event) => {
   if (!state.searchJobId || !state.searchPapers.length) {
     alert("请先检索出文献记录。");
@@ -1166,6 +1215,9 @@ document.querySelectorAll("[data-picker-repo]").forEach((button) => {
 });
 document.querySelectorAll("[data-pdf-filter]").forEach((button) => {
   button.addEventListener("click", () => setPdfFilter(button.dataset.pdfFilter));
+});
+document.querySelectorAll("[data-quartile-filter]").forEach((button) => {
+  button.addEventListener("click", () => setQuartileFilter(button.dataset.quartileFilter));
 });
 document.querySelectorAll("[data-sort-direction]").forEach((button) => {
   button.addEventListener("click", () => applySortDirection(button.dataset.sortDirection));
@@ -1199,6 +1251,13 @@ document.addEventListener("mousedown", (event) => {
     && !event.target.closest("#journalFilterBtn")
   ) {
     closeJournalFilterPicker();
+  }
+  if (
+    !$("quartileFilterPicker").hidden
+    && !event.target.closest("#quartileFilterPicker")
+    && !event.target.closest("#quartileFilterBtn")
+  ) {
+    closeQuartileFilterPicker();
   }
   if (
     !$("sortPicker").hidden

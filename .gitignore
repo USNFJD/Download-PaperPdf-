@@ -11,6 +11,10 @@ artifacts/
 run.log
 *.log
 *.lock
+*.exe
+*.spec
+build/
+dist/
 
 .browser_profile/
 *.sqlite3

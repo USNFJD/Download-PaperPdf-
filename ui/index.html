@@ -3,9 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Download-PaperPdf-MarLous</title>
+    <title>PaperPdf-MarLous</title>
     <link rel="icon" href="/assets/MarLous.png" />
-    <link rel="stylesheet" href="/assets/style.css?v=20260607-toolbar-one-line" />
+    <link rel="stylesheet" href="/assets/style.css?v=20260608-quartile-filter" />
   </head>
   <body>
     <div class="shell">
@@ -13,7 +13,7 @@
         <div class="brand">
           <img class="mark" src="/assets/MarLous.png" alt="MarLous" />
           <div>
-            <h1>Download-PaperPdf-MarLous</h1>
+            <h1>PaperPdf-MarLous</h1>
             <p>检索、入库、按库下载</p>
           </div>
         </div>
@@ -131,7 +131,7 @@
                   <th><button class="th-sort" id="sortDateBtn" type="button">发表时间</button></th>
                   <th><button class="th-sort" id="sortRelevanceValueBtn" type="button">关联度</button></th>
                   <th>所在仓库</th>
-                  <th>SCI 分区</th>
+                  <th><button class="th-sort" id="quartileFilterBtn" type="button">SCI 分区</button></th>
                   <th><button class="th-sort" id="journalFilterBtn" type="button">期刊</button></th>
                   <th><button class="th-sort" id="pdfFilterBtn" type="button">PDF</button></th>
                   <th><button class="th-action" id="addAllRepoBtn" type="button">全部加入</button></th>
@@ -165,11 +165,20 @@
       <div class="repo-picker-title">期刊筛选</div>
       <div id="journalFilterOptions"></div>
     </div>
+    <div id="quartileFilterPicker" class="repo-picker quartile-filter-picker" hidden>
+      <div class="repo-picker-title">SCI分区筛选</div>
+      <button type="button" data-quartile-filter="Q1">Q1</button>
+      <button type="button" data-quartile-filter="Q2">Q2</button>
+      <button type="button" data-quartile-filter="Q3">Q3</button>
+      <button type="button" data-quartile-filter="Q4">Q4</button>
+      <button type="button" data-quartile-filter="other">其他</button>
+      <button type="button" data-quartile-filter="all">显示全部</button>
+    </div>
     <div id="sortPicker" class="repo-picker" hidden>
       <div class="repo-picker-title" id="sortPickerTitle">排序</div>
       <button type="button" data-sort-direction="asc">正序</button>
       <button type="button" data-sort-direction="desc">倒序</button>
     </div>
-    <script src="/assets/app.js?v=20260607-toolbar-one-line"></script>
+    <script src="/assets/app.js?v=20260608-quartile-filter"></script>
   </body>
 </html>
