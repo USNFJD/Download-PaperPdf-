@@ -21,7 +21,9 @@ from paper_oa_downloader import runtime_log
 from paper_oa_downloader.server import create_app
 
 
-ROOT = Path(__file__).resolve().parent
+BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+APP_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+ROOT = APP_ROOT
 LOG_PATH = ROOT / "data" / "app.log"
 LOCK_HANDLE = None
 LOCK_SOCKET = None
@@ -104,7 +106,7 @@ def run_server(port: int) -> None:
     try:
         runtime_log.write(f"Backend process starting on port {port}.", "backend")
         config = uvicorn.Config(
-            create_app(ROOT),
+            create_app(BUNDLE_ROOT, ROOT),
             host="127.0.0.1",
             port=port,
             log_level="warning",
@@ -491,11 +493,15 @@ def main() -> None:
     url = f"http://127.0.0.1:{port}"
     log(f"Starting backend at {url}")
 
-    backend_python = ROOT / ".venv" / "Scripts" / "python.exe"
-    if not backend_python.exists():
-        backend_python = Path(sys.executable)
+    if getattr(sys, "frozen", False):
+        backend_command = [str(Path(sys.executable).resolve()), "--backend", str(port)]
+    else:
+        backend_python = ROOT / ".venv" / "Scripts" / "python.exe"
+        if not backend_python.exists():
+            backend_python = Path(sys.executable)
+        backend_command = [str(backend_python), str(Path(__file__).resolve()), "--backend", str(port)]
     backend = subprocess.Popen(
-        [str(backend_python), str(Path(__file__).resolve()), "--backend", str(port)],
+        backend_command,
         cwd=str(ROOT),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
@@ -575,7 +581,7 @@ def main() -> None:
             on_webview_ready,
             gui="edgechromium",
             private_mode=True,
-            icon=str(ROOT / "MarLous.ico"),
+            icon=str(BUNDLE_ROOT / "MarLous.ico"),
         )
         runtime_log.write("WebView event loop ended.", "desktop")
     except Exception as exc:
@@ -593,6 +599,10 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
+        if len(sys.argv) >= 2 and sys.argv[1] == "--browser-fetcher":
+            from paper_oa_downloader.browser_pdf_fetcher import main as browser_fetcher_main
+
+            raise SystemExit(browser_fetcher_main(sys.argv[2:]))
         if len(sys.argv) == 3 and sys.argv[1] == "--backend":
             run_backend_process(int(sys.argv[2]))
         else:

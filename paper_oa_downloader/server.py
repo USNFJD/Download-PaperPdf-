@@ -112,8 +112,12 @@ class JobState:
             }
 
 
-def create_sample_quartile_csv(path: Path) -> None:
+def create_sample_quartile_csv(path: Path, bundled_path: Path | None = None) -> None:
     if path.exists():
+        return
+    if bundled_path and bundled_path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundled_path, path)
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -216,10 +220,11 @@ def normalize_repo_id(repo_id: str) -> str:
     return repo_id
 
 
-def create_app(root: Path) -> FastAPI:
+def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
+    storage_root = storage_root or root
     runtime_log.write(f"FastAPI app created. root={root}", "server")
-    default_data_dir = root / "data"
-    default_downloads_dir = root / "downloads"
+    default_data_dir = storage_root / "data"
+    default_downloads_dir = storage_root / "downloads"
     reserved_project_dirs = {
         ".agents",
         ".codex",
@@ -237,7 +242,7 @@ def create_app(root: Path) -> FastAPI:
     app_settings_path = default_data_dir / "settings.json"
     ui_dir = root / "ui"
     quartile_path = default_data_dir / "journal_quartiles.csv"
-    create_sample_quartile_csv(quartile_path)
+    create_sample_quartile_csv(quartile_path, root / "data" / "journal_quartiles.csv")
     quartiles = QuartileLookup(quartile_path)
     oa_sources_cache_path = default_data_dir / "oa_publisher_sources.json"
     active_project_id: str | None = None
@@ -287,7 +292,7 @@ def create_app(root: Path) -> FastAPI:
             selected_path = Path(raw)
             if selected_path.is_absolute():
                 resolved = selected_path.resolve()
-                if resolved.parent != root.resolve():
+                if resolved.parent != storage_root.resolve():
                     raise HTTPException(400, "请选择程序目录下的项目文件夹。")
                 cleaned = safe_filename(resolved.name, "project")
             else:
@@ -312,7 +317,7 @@ def create_app(root: Path) -> FastAPI:
         selected = project_id if project_id is not None else active_project_id
         if not selected:
             raise HTTPException(400, "请先新建项目。")
-        return root / selected
+        return storage_root / selected
 
     def project_paths(project_id: str | None = None) -> tuple[Path, Path]:
         base = project_root(project_id)
@@ -1220,7 +1225,7 @@ def create_app(root: Path) -> FastAPI:
     @app.get("/api/projects")
     def projects() -> Response:
         items = []
-        for path in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
+        for path in sorted(storage_root.iterdir(), key=lambda item: item.name.casefold()):
             if not path.is_dir():
                 continue
             if path.name.casefold() in reserved_project_dirs:
@@ -1248,7 +1253,7 @@ def create_app(root: Path) -> FastAPI:
         nonlocal active_project_id
         project_id = project_id_from_name(request.name)
         validate_project_id(project_id)
-        if not (root / project_id).is_dir():
+        if not (storage_root / project_id).is_dir():
             raise HTTPException(404, "Project not found.")
         ensure_project(project_id)
         active_project_id = project_id

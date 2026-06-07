@@ -168,8 +168,9 @@ class PdfDownloader:
         original_error: Exception,
         manual: bool = False,
     ) -> Path:
+        frozen = bool(getattr(sys, "frozen", False))
         script = Path(__file__).with_name("browser_pdf_fetcher.py")
-        if not script.exists():
+        if not frozen and not script.exists():
             raise RuntimeError(f"后台直连失败，且浏览器下载脚本不存在：{original_error}") from original_error
 
         target = target.resolve()
@@ -182,16 +183,22 @@ class PdfDownloader:
             timeout_seconds = 650 if manual else 55
             env = os.environ.copy()
             env["PAPER_OA_HANDOFF_FIRST_ACTION_SECONDS"] = str(self.handoff_first_action_seconds)
-            result = subprocess.run(
+            command = [sys.executable]
+            if frozen:
+                command.append("--browser-fetcher")
+            else:
+                command.append(str(script))
+            command.extend(
                 [
-                    sys.executable,
-                    str(script),
                     paper.get("pdf_url") or "",
                     str(target),
                     str(profile_dir),
                     "--manual" if manual else "--auto",
-                ],
-                cwd=str(Path(__file__).resolve().parents[1]),
+                ]
+            )
+            result = subprocess.run(
+                command,
+                cwd=str(Path(sys.executable).resolve().parent if frozen else Path(__file__).resolve().parents[1]),
                 text=True,
                 capture_output=True,
                 timeout=timeout_seconds,

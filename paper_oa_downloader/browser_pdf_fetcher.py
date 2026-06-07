@@ -232,15 +232,16 @@ def user_has_acted(page, expected_geometry: tuple[int, int, int, int] | None = N
     return False
 
 
-def main() -> int:
-    if len(sys.argv) not in {4, 5}:
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if len(argv) not in {3, 4}:
         print("Usage: browser_pdf_fetcher.py <pdf_url> <target> <profile_dir> [--auto|--manual]", file=sys.stderr)
         return 2
 
-    pdf_url = sys.argv[1]
-    target = Path(sys.argv[2]).resolve()
-    profile_dir = Path(sys.argv[3]).resolve()
-    manual = len(sys.argv) == 5 and sys.argv[4] == "--manual"
+    pdf_url = argv[0]
+    target = Path(argv[1]).resolve()
+    profile_dir = Path(argv[2]).resolve()
+    manual = len(argv) == 4 and argv[3] == "--manual"
     log(f"Browser fetcher started. manual={manual}; url={pdf_url}; target={target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     profile_dir.mkdir(parents=True, exist_ok=True)
