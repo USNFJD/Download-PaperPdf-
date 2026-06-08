@@ -89,3 +89,7 @@ class Storage:
                 item["authors"] = []
             result.append(item)
         return result
+
+    def delete_paper(self, paper_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,))

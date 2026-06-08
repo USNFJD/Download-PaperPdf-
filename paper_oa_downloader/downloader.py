@@ -215,9 +215,6 @@ class PdfDownloader:
             runtime_log.write(f"Browser PDF fetcher saved file. target={target}", "download")
             return target
         detail = (result.stderr or result.stdout or "").strip()
-        if result.returncode == 7 and not manual:
-            runtime_log.write("Browser fetcher detected human verification; retrying with visible manual handoff.", "download")
-            return self._download_with_browser_subprocess(paper, target, original_error, manual=True)
         runtime_log.write(f"Browser PDF fetcher failed. returncode={result.returncode}; detail={detail}", "download")
         raise RuntimeError(f"后台直连失败，浏览器兜底也未捕获到 PDF：{detail or original_error}") from original_error
 

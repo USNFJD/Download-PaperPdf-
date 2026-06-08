@@ -169,6 +169,41 @@ def terminate_process_tree(process: subprocess.Popen | None, timeout_seconds: fl
         process.kill()
 
 
+def install_webview_download_hook(desktop_api) -> None:
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        from webview.platforms import edgechromium
+
+        original = edgechromium.EdgeChrome.on_download_starting
+        if getattr(original, "_marlous_hooked", False):
+            return
+
+        def on_download_starting(self, sender, args):
+            desktop_api.allow_preview_focus_loss(600)
+            original(self, sender, args)
+            try:
+                if getattr(args, "Cancel", False):
+                    return
+                result_path = str(getattr(args, "ResultFilePath", "") or "")
+                if not result_path:
+                    return
+                desktop_api.allow_preview_focus_loss(120)
+                threading.Thread(
+                    target=desktop_api.import_saved_pdf_from_preview,
+                    args=(result_path,),
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                runtime_log.write(f"WebView download hook failed: {exc!r}", "preview")
+
+        on_download_starting._marlous_hooked = True
+        edgechromium.EdgeChrome.on_download_starting = on_download_starting
+        runtime_log.write("WebView download hook installed.", "preview")
+    except Exception as exc:
+        runtime_log.write(f"WebView download hook install skipped: {exc!r}", "preview")
+
+
 class DesktopApi:
     def __init__(self, base_url: str):
         self.base_url = base_url
@@ -180,6 +215,8 @@ class DesktopApi:
         self.following_started = False
         self.preview_owner_key: tuple[int, int] | None = None
         self.preview_created_at = 0.0
+        self.preview_focus_grace_until = 0.0
+        self.source_context: dict[str, str] = {}
 
     def set_main_window(self, window) -> None:
         with self.lock:
@@ -296,15 +333,21 @@ class DesktopApi:
             return True
         with self.lock:
             preview = self.preview_window
+            main = self.main_window
+            focus_grace_until = self.preview_focus_grace_until
         if not preview:
             return False
+        if time.time() < focus_grace_until:
+            return True
         if time.time() - self.preview_created_at < 0.6:
             return True
         preview_hwnd = self._native_hwnd(preview)
+        main_hwnd = self._native_hwnd(main) if main else 0
         if not preview_hwnd:
             return True
         try:
             import ctypes
+            import os
 
             user32 = ctypes.windll.user32
             get_foreground_window = user32.GetForegroundWindow
@@ -312,16 +355,28 @@ class DesktopApi:
             is_child = user32.IsChild
             is_child.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             is_child.restype = ctypes.c_bool
-            get_ancestor = user32.GetAncestor
-            get_ancestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-            get_ancestor.restype = ctypes.c_void_p
+            get_window_thread_process_id = user32.GetWindowThreadProcessId
+            get_window_thread_process_id.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+            get_window_thread_process_id.restype = ctypes.c_uint
             foreground = int(get_foreground_window() or 0)
             if not foreground:
                 return True
-            return foreground == preview_hwnd or bool(is_child(preview_hwnd, foreground))
+            if foreground == preview_hwnd or bool(is_child(preview_hwnd, foreground)):
+                return True
+            if main_hwnd and (foreground == main_hwnd or bool(is_child(main_hwnd, foreground))):
+                return False
+            foreground_pid = ctypes.c_uint(0)
+            get_window_thread_process_id(foreground, ctypes.byref(foreground_pid))
+            if int(foreground_pid.value or 0) == os.getpid():
+                return True
+            return False
         except Exception as exc:
             runtime_log.write(f"Preview focus check skipped: {exc!r}", "preview")
             return True
+
+    def allow_preview_focus_loss(self, seconds: float = 30.0) -> None:
+        with self.lock:
+            self.preview_focus_grace_until = max(self.preview_focus_grace_until, time.time() + seconds)
 
     def _follow_main_window(self) -> None:
         while True:
@@ -359,6 +414,16 @@ class DesktopApi:
             except Exception as exc:
                 runtime_log.write(f"Old preview window destroy skipped: {exc!r}", "preview")
 
+    def _expose_preview_bridge(self, preview) -> None:
+        try:
+            preview.expose(
+                self.select_pdf_file,
+                self.set_source_context,
+            )
+            runtime_log.write("Preview bridge exposed.", "preview")
+        except Exception as exc:
+            runtime_log.write(f"Preview bridge expose failed: {exc!r}", "preview")
+
     def _show_preview_tabs(self) -> dict[str, str]:
         import webview
 
@@ -378,6 +443,7 @@ class DesktopApi:
                 confirm_close=False,
                 focus=True,
             )
+            self._expose_preview_bridge(preview)
             with self.lock:
                 self.preview_window = preview
                 self.preview_owner_key = None
@@ -388,8 +454,7 @@ class DesktopApi:
             return {"status": "created", "url": tabs_url}
         except Exception as exc:
             log("Preview window failed: " + repr(exc))
-            webbrowser.open(tabs_url)
-            return {"status": "browser", "url": tabs_url}
+            return {"status": "error", "url": tabs_url, "error": str(exc)}
 
     def _add_preview_tab(self, title: str, url: str) -> dict[str, str]:
         with self.lock:
@@ -411,6 +476,7 @@ class DesktopApi:
         title: str = "",
         home_url: str = "",
     ) -> dict[str, str]:
+        self.set_source_context(paper_id, search_job_id, repo_id)
         params = urlencode(
             {
                 "url": source_url,
@@ -423,6 +489,83 @@ class DesktopApi:
         source_preview_url = urljoin(self.base_url + "/", f"/source-preview?{params}")
         runtime_log.write(f"Source preview requested: {source_preview_url}", "preview")
         return self._add_preview_tab(title or "PDF", source_preview_url)
+
+    def set_source_context(self, paper_id: str, search_job_id: str = "", repo_id: str = "search") -> dict[str, str]:
+        with self.lock:
+            self.source_context = {
+                "paper_id": paper_id or "",
+                "search_job_id": search_job_id or "",
+                "repo_id": repo_id if repo_id in {"repo1", "repo2", "repo3"} else "",
+            }
+        return {"status": "ok"}
+
+    def _wait_for_saved_pdf(self, path: Path, timeout_seconds: int = 90) -> bool:
+        deadline = time.time() + timeout_seconds
+        last_size = -1
+        stable_since = 0.0
+        while time.time() < deadline:
+            if path.is_file() and path.suffix.lower() == ".pdf":
+                size = path.stat().st_size
+                if size > 1024 and size == last_size:
+                    if not stable_since:
+                        stable_since = time.time()
+                    if time.time() - stable_since >= 1.0:
+                        return True
+                else:
+                    stable_since = 0.0
+                    last_size = size
+            time.sleep(0.4)
+        return False
+
+    def import_saved_pdf_from_preview(self, path_value: str) -> None:
+        path = Path(path_value)
+        with self.lock:
+            context = dict(self.source_context)
+        repo_id = context.get("repo_id") or ""
+        paper_id = context.get("paper_id") or ""
+        if not repo_id or not paper_id:
+            runtime_log.write(f"Saved PDF import skipped; missing source context. path={path}", "preview")
+            return
+        if not self._wait_for_saved_pdf(path):
+            runtime_log.write(f"Saved PDF import skipped; file was not ready. path={path}", "preview")
+            return
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/repositories/{repo_id}/import-pdf",
+                json={
+                    "search_job_id": context.get("search_job_id") or "",
+                    "paper_id": paper_id,
+                    "pdf_path": str(path),
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            runtime_log.write(f"Saved PDF imported from WebView download. source={path}; repo={repo_id}", "preview")
+            payload = {
+                "type": "paper-pdf-imported",
+                "repoId": repo_id,
+                "paperId": paper_id,
+                "pdfPath": response.json().get("pdf_path", ""),
+            }
+            script = (
+                "try { new BroadcastChannel('paper-pdf-events').postMessage("
+                + json.dumps(payload, ensure_ascii=False)
+                + "); } catch (err) {}"
+                "try { localStorage.setItem('paper-pdf-imported', "
+                + json.dumps(json.dumps({**payload, "at": int(time.time() * 1000)}, ensure_ascii=False))
+                + "); } catch (err) {}"
+            )
+            with self.lock:
+                main = self.main_window
+                preview = self.preview_window
+            for window in (main, preview):
+                try:
+                    if window:
+                        window.run_js(script)
+                except Exception:
+                    pass
+        except Exception as exc:
+            runtime_log.write(f"Saved PDF import failed. source={path}; error={exc!r}", "preview")
 
     def select_pdf_file(self) -> dict[str, str]:
         try:
@@ -539,6 +682,7 @@ def main() -> None:
 
         runtime_log.write("WebView module imported.", "desktop")
         desktop_api = DesktopApi(url)
+        install_webview_download_hook(desktop_api)
 
         def on_main_closing() -> None:
             runtime_log.write("Main window is closing.", "desktop")
@@ -571,6 +715,7 @@ def main() -> None:
                     desktop_api.close_preview,
                     desktop_api.select_pdf_file,
                     desktop_api.select_project_folder,
+                    desktop_api.set_source_context,
                 )
                 runtime_log.write("Desktop bridge exposed after WebView startup.", "desktop")
             except Exception as exc:
@@ -585,13 +730,8 @@ def main() -> None:
         )
         runtime_log.write("WebView event loop ended.", "desktop")
     except Exception as exc:
-        log("WebView failed, opening browser: " + repr(exc))
-        webbrowser.open(url)
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            return
+        log("WebView failed; browser fallback is disabled: " + repr(exc))
+        raise
     finally:
         runtime_log.write("Desktop main loop ended; cleaning backend.", "desktop")
         cleanup_backend()

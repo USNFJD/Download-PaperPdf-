@@ -22,6 +22,7 @@
   currentProject: "",
   currentProjectPath: "",
   hasProject: false,
+  clientEventCursor: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -386,7 +387,7 @@ function renderPapers(papers, mode = "search") {
       const pdfCell = pdfCellHtml(paper, paperKeyValue, previewTitle);
       const alreadyInRepo = mode === "search" && isPaperInAnyRepo(paper);
       const actionCell = mode === "repo"
-        ? `<button class="mini danger" data-delete-index="${index}">删除</button>`
+        ? `<button class="mini danger" data-delete-paper="${paperKeyValue}">删除</button>`
         : alreadyInRepo
           ? `<button class="mini add-repo-btn" type="button" disabled>已入库</button>`
           : `<button class="mini add-repo-btn" type="button" data-add-paper="${paperKeyValue}">加入仓库</button>`;
@@ -421,8 +422,8 @@ function renderPapers(papers, mode = "search") {
     })
     .join("");
 
-  document.querySelectorAll("[data-delete-index]").forEach((button) => {
-    button.addEventListener("click", () => deleteRepositoryItem(Number(button.dataset.deleteIndex)));
+  document.querySelectorAll("[data-delete-paper]").forEach((button) => {
+    button.addEventListener("click", () => deleteRepositoryItem(button.dataset.deletePaper));
   });
   document.querySelectorAll("[data-preview-url]").forEach((button) => {
     button.addEventListener("click", (event) => {
@@ -452,7 +453,7 @@ async function openPdfPreview(url, title = "") {
       state.previewOpen = false;
     });
   } else {
-    window.open(url, "_blank");
+    $("statusText").textContent = "当前窗口不能打开副窗口预览。";
   }
 }
 
@@ -670,10 +671,10 @@ async function openSourcePreview(sourceUrl, paperKeyValue, previewTitle = "", ho
       homeUrl || sourceUrl,
     ).catch(() => {
       state.previewOpen = false;
-      window.open(sourceUrl, "_blank");
+      $("statusText").textContent = "当前窗口不能打开源副窗口。";
     });
   } else {
-    window.open(sourceUrl, "_blank");
+    $("statusText").textContent = "当前窗口不能打开源副窗口。";
   }
 }
 
@@ -933,7 +934,7 @@ async function refreshRepositoryState() {
 function applyDownloadedPaths(downloaded, papers) {
   for (const paper of papers || []) {
     const path = downloaded.get(normalizedPaperKey(paper));
-    if (path) paper.pdf_path = path;
+    paper.pdf_path = path || "";
   }
 }
 
@@ -949,11 +950,23 @@ async function handleRepoSelectionChange() {
   await loadSelectedRecord();
 }
 
-async function deleteRepositoryItem(index) {
+async function deleteRepositoryItem(paperKeyValue) {
   const repoId = $("repoSelect").value;
   if (repoId === "search") return;
-  await api(`/api/repositories/${repoId}/items/${index}`, { method: "DELETE" });
+  await api(`/api/repositories/${repoId}/items?paper_id=${encodeURIComponent(paperKeyValue)}`, { method: "DELETE" });
+  await refreshRepositoryState();
   await loadRepository();
+}
+
+async function handleExternalPdfImport(message = "PDF已导入") {
+  await refreshRepositoryState();
+  renderPapers(state.mode === "repo" ? state.renderSourcePapers : state.searchPapers, state.mode);
+  $("statusText").textContent = message;
+}
+
+function handlePreviewStatus(message) {
+  const value = String(message || "").trim();
+  if (value) $("statusText").textContent = value;
 }
 
 async function downloadRepository() {
@@ -1269,6 +1282,71 @@ document.addEventListener("mousedown", (event) => {
   }
 });
 
+try {
+  const pdfEvents = new BroadcastChannel("paper-pdf-events");
+  pdfEvents.onmessage = (event) => {
+    if (event.data?.type === "paper-pdf-imported") {
+      handleExternalPdfImport(event.data.message || "PDF已导入").catch((err) => {
+        $("statusText").textContent = err.message;
+      });
+    }
+  };
+} catch (err) {}
+
+try {
+  const statusEvents = new BroadcastChannel("paper-status-events");
+  statusEvents.onmessage = (event) => {
+    if (event.data?.type === "preview-status") {
+      handlePreviewStatus(event.data.message);
+    }
+  };
+} catch (err) {}
+
+window.addEventListener("storage", (event) => {
+  if (event.key === "paper-pdf-imported" && event.newValue) {
+    try {
+      const data = JSON.parse(event.newValue);
+      handleExternalPdfImport(data.message || "PDF已导入").catch((err) => {
+        $("statusText").textContent = err.message;
+      });
+    } catch (err) {
+      handleExternalPdfImport().catch((importErr) => {
+        $("statusText").textContent = importErr.message;
+      });
+    }
+    return;
+  }
+  if (event.key === "paper-preview-status" && event.newValue) {
+    try {
+      const data = JSON.parse(event.newValue);
+      handlePreviewStatus(data.message);
+    } catch (err) {}
+  }
+});
+
+window.addEventListener("focus", () => {
+  if (!state.hasProject) return;
+  refreshRepositoryState()
+    .then(() => renderPapers(state.mode === "repo" ? state.renderSourcePapers : state.searchPapers, state.mode))
+    .catch(() => {});
+});
+
+async function pollClientEvents() {
+  try {
+    const data = await api(`/api/client-events?since=${state.clientEventCursor || 0}`);
+    state.clientEventCursor = Number(data.latest || state.clientEventCursor || 0);
+    for (const event of data.events || []) {
+      if (event.type === "paper-pdf-imported") {
+        await handleExternalPdfImport(event.message || "PDF提取完成");
+      }
+    }
+  } catch (err) {
+    // Keep polling; the backend may be restarting.
+  } finally {
+    setTimeout(() => pollClientEvents(), 2000);
+  }
+}
+
 function mountListStatusLine() {
   const main = document.querySelector(".main");
   const content = document.querySelector(".content");
@@ -1290,6 +1368,7 @@ function mountListStatusLine() {
 }
 
 mountListStatusLine();
+pollClientEvents();
 setSearchButtonMode(false);
 setProgress(0, 0, "进度");
 async function initializeApp() {

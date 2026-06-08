@@ -6,6 +6,7 @@ import traceback
 import os
 import threading
 from pathlib import Path
+from urllib.parse import urljoin
 
 
 MAIN_WINDOW_TITLE = "Download-PaperPdf-MarLous"
@@ -48,6 +49,35 @@ def is_complete_pdf(body: bytes) -> bool:
     if not body.startswith(b"%PDF") or len(body) <= 1024:
         return False
     return b"%%EOF" in body[-4096:]
+
+
+def candidate_pdf_urls(page, fallback_url: str) -> list[str]:
+    urls = []
+    seen = set()
+
+    def add(value: str) -> None:
+        value = str(value or "").strip()
+        if not value:
+            return
+        absolute = urljoin(page.url or fallback_url, value)
+        if absolute and absolute not in seen:
+            seen.add(absolute)
+            urls.append(absolute)
+
+    add(page.url or fallback_url)
+    add(fallback_url)
+    for frame in page.frames:
+        add(getattr(frame, "url", "") or "")
+    for selector in ("iframe[src]", "embed[src]", "object[data]", "a[href*='.pdf']", "a[href*='pdf']"):
+        try:
+            elements = page.locator(selector)
+            count = min(elements.count(), 12)
+            for index in range(count):
+                element = elements.nth(index)
+                add(element.get_attribute("src") or element.get_attribute("data") or element.get_attribute("href") or "")
+        except Exception:
+            pass
+    return urls
 
 
 def handoff_first_action_seconds() -> int:
@@ -365,24 +395,24 @@ def main(argv: list[str] | None = None) -> int:
                     log("Human verification detected during wait; skipping.")
                     print("SKIP_HUMAN_VERIFICATION: source page requires human verification.", file=sys.stderr)
                     return 7
-                try:
-                    current_url = page.url or pdf_url
-                    browser_response = context.request.get(current_url, timeout=90000)
-                    last_status = browser_response.status
-                    content_type = (browser_response.headers.get("content-type") or "").lower()
-                    body = browser_response.body()
-                    if browser_response.ok and is_complete_pdf(body):
-                        target.write_bytes(body)
-                        log(f"PDF saved from browser request. target={target}")
-                        return 0
-                    if browser_response.ok and "pdf" in content_type:
-                        log(
-                            f"Browser request returned PDF-like incomplete body. "
-                            f"bytes={len(body)}; starts={body[:16]!r}; url={browser_response.url}"
-                        )
-                except Exception as exc:
-                    last_error = str(exc)
-                    log(f"Browser request PDF fetch failed during wait: {last_error}")
+                for current_url in candidate_pdf_urls(page, pdf_url):
+                    try:
+                        browser_response = context.request.get(current_url, timeout=90000)
+                        last_status = browser_response.status
+                        content_type = (browser_response.headers.get("content-type") or "").lower()
+                        body = browser_response.body()
+                        if browser_response.ok and is_complete_pdf(body):
+                            target.write_bytes(body)
+                            log(f"PDF saved from browser request. target={target}; url={browser_response.url}")
+                            return 0
+                        if browser_response.ok and "pdf" in content_type:
+                            log(
+                                f"Browser request returned PDF-like incomplete body. "
+                                f"bytes={len(body)}; starts={body[:16]!r}; url={browser_response.url}"
+                            )
+                    except Exception as exc:
+                        last_error = str(exc)
+                        log(f"Browser request PDF fetch failed during wait: url={current_url}; error={last_error}")
 
                 if manual:
                     try:

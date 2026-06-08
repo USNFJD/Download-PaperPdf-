@@ -61,6 +61,19 @@ class ImportPdfRequest(BaseModel):
     pdf_path: str
 
 
+class SaveSourcePdfRequest(BaseModel):
+    search_job_id: str = ""
+    paper_id: str
+    source_url: str
+
+
+class OpenArticleHomeRequest(BaseModel):
+    url: str
+    search_job_id: str = ""
+    paper_id: str = ""
+    repo_id: str = "search"
+
+
 class ProjectRequest(BaseModel):
     name: str
 
@@ -248,8 +261,20 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
     active_project_id: str | None = None
     jobs: dict[str, JobState] = {}
     search_results: dict[str, list[dict[str, Any]]] = {}
+    client_events: list[dict[str, Any]] = []
+    client_events_lock = threading.Lock()
 
     app = FastAPI(title="OA PDF Downloader")
+
+    def emit_client_event(event: dict[str, Any]) -> None:
+        with client_events_lock:
+            item = {
+                "id": len(client_events) + 1,
+                "time": time.time(),
+                **event,
+            }
+            client_events.append(item)
+            del client_events[:-200]
 
     def normalize_handoff_seconds(value: Any) -> int:
         try:
@@ -595,6 +620,24 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
                     if path.is_file() and path.suffix.lower() == ".pdf":
                         return path
         return None
+
+    def remove_paper_pdf_file(paper: dict[str, Any]) -> bool:
+        paper_with_pdf = attach_downloaded_pdf(dict(paper))
+        path = Path(paper_with_pdf.get("pdf_path") or "")
+        if not path.is_file() or path.suffix.lower() != ".pdf":
+            return False
+        try:
+            path.resolve().relative_to(downloads_dir().resolve())
+        except ValueError:
+            runtime_log.write(f"Skipped PDF deletion outside downloads. path={path}", "api")
+            return False
+        try:
+            path.unlink()
+            runtime_log.write(f"Deleted repository PDF file. path={path}", "api")
+            return True
+        except Exception as exc:
+            runtime_log.write(f"PDF deletion failed. path={path}; error={exc!r}", "api")
+            return False
 
     def ensure_paper_in_repository(repo_id: str, paper: dict[str, Any]) -> list[dict[str, Any]]:
         repositories = load_repositories()
@@ -1083,8 +1126,11 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
 
             def download_one(index: int, paper: dict[str, Any]) -> tuple[int, dict[str, Any], Path | None, str]:
                 try:
+                    paper = attach_downloaded_pdf(dict(paper))
                     existing = reusable_pdf_path(paper.get("pdf_path"))
                     if existing:
+                        paper["pdf_path"] = str(existing)
+                        project_db().upsert_paper(paper)
                         return index, paper, existing, "SKIP_EXISTING_LOCAL"
                     if not paper.get("pdf_url"):
                         return index, paper, None, "SKIP_NO_SOURCE"
@@ -1153,12 +1199,12 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
             job.total = 1
             job.target = 1
             target_dir = downloads_dir() / repo_id
-            job.log(f"Opening and saving source PDF: {paper.get('title')}")
+            job.log(f"Saving source PDF without opening an external browser: {paper.get('title')}")
             settings = load_app_settings()
             path = PdfDownloader(
                 target_dir,
                 handoff_first_action_seconds=settings["handoff_first_action_seconds"],
-            ).download_with_visible_browser(paper)
+            ).download(paper)
             updated = dict(paper)
             updated["pdf_path"] = str(path)
             project_db().upsert_paper(updated)
@@ -1190,6 +1236,137 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
                 job.error = str(exc)
                 job.log(f"Manual PDF download failed: {exc}")
             job.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def edge_download_dirs() -> list[Path]:
+        roots = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "User Data",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge Beta" / "User Data",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge Dev" / "User Data",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Edge SxS" / "User Data",
+        ]
+        dirs: list[Path] = []
+        for root_path in roots:
+            if not root_path.exists():
+                continue
+            for pref_path in root_path.glob("*/Preferences"):
+                try:
+                    data = json.loads(pref_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                raw = str((data.get("download") or {}).get("default_directory") or "").strip()
+                if not raw:
+                    continue
+                expanded = os.path.expandvars(raw)
+                path = Path(expanded).expanduser()
+                if path.exists() and path.is_dir():
+                    dirs.append(path.resolve())
+        return dirs
+
+    def browser_download_dirs() -> list[Path]:
+        candidates = [
+            *edge_download_dirs(),
+            Path.home() / "Downloads",
+            Path.home() / "下载",
+        ]
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+            except Exception:
+                continue
+            key = str(resolved).casefold()
+            if key in seen or not resolved.exists() or not resolved.is_dir():
+                continue
+            seen.add(key)
+            unique.append(resolved)
+        return unique
+
+    def pdf_snapshot(paths: list[Path]) -> dict[Path, tuple[int, float]]:
+        snapshot: dict[Path, tuple[int, float]] = {}
+        for folder in paths:
+            for path in folder.glob("*.pdf"):
+                try:
+                    stat = path.stat()
+                    snapshot[path.resolve()] = (stat.st_size, stat.st_mtime)
+                except Exception:
+                    pass
+        return snapshot
+
+    def wait_for_stable_pdf(path: Path, timeout_seconds: int = 30) -> bool:
+        deadline = time.time() + timeout_seconds
+        last_size = -1
+        stable_since = 0.0
+        while time.time() < deadline:
+            try:
+                size = path.stat().st_size
+            except Exception:
+                time.sleep(0.4)
+                continue
+            if size > 1024 and size == last_size:
+                if not stable_since:
+                    stable_since = time.time()
+                if time.time() - stable_since >= 1.0:
+                    return True
+            else:
+                stable_since = 0.0
+                last_size = size
+            time.sleep(0.4)
+        return False
+
+    def run_browser_download_import_job(
+        job: JobState,
+        repo_id: str,
+        paper_id: str,
+        search_job_id: str,
+        before: dict[Path, tuple[int, float]],
+        started_at: float,
+    ) -> None:
+        job.status = "watching"
+        job.total = 1
+        job.target = 1
+        folders = browser_download_dirs()
+        job.log("Watching browser downloads for a new PDF: " + " | ".join(str(path) for path in folders))
+        deadline = time.time() + 300
+        try:
+            while time.time() < deadline:
+                current = pdf_snapshot(folders)
+                candidates: list[Path] = []
+                for path, (size, mtime) in current.items():
+                    old = before.get(path)
+                    if size <= 1024 or mtime < started_at - 1:
+                        continue
+                    if old is None or old != (size, mtime):
+                        candidates.append(path)
+                candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+                for path in candidates:
+                    if not wait_for_stable_pdf(path, timeout_seconds=8):
+                        continue
+                    result = import_pdf_file(repo_id, paper_id, search_job_id, str(path))
+                    target_path = Path(result["pdf_path"]).resolve()
+                    source_path = path.resolve()
+                    if source_path != target_path:
+                        try:
+                            source_path.unlink()
+                            runtime_log.write(f"Removed browser download source PDF after import. path={source_path}", "api")
+                        except Exception as exc:
+                            runtime_log.write(f"Could not remove browser download source PDF. path={source_path}; error={exc!r}", "api")
+                    job.downloaded = 1
+                    job.status = "finished"
+                    job.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+                    job.log(f"Browser PDF imported: {target_path.name}")
+                    return
+                time.sleep(1.5)
+            job.status = "finished"
+            job.skipped = 1
+            job.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            job.log("No new browser PDF download was detected.")
+        except Exception as exc:
+            job.failed = 1
+            job.status = "error"
+            job.error = str(exc)
+            job.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            job.log(f"Browser PDF import failed: {exc}")
 
     @app.get("/api/publishers")
     def publishers() -> list[dict[str, str]]:
@@ -1276,8 +1453,11 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
         data = load_repositories()
         return {
             repo_id: [
-                {"key": candidate_key(paper)}
-                for paper in papers
+                {
+                    "key": candidate_key(public_paper),
+                    "pdf_path": str(public_paper.get("pdf_path") or ""),
+                }
+                for public_paper in public_papers(papers)
             ]
             for repo_id, papers in data.items()
         }
@@ -1340,7 +1520,35 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
         repo = repositories[repo_id]
         if index < 0 or index >= len(repo):
             raise HTTPException(404, "Repository item not found.")
-        del repo[index]
+        removed = repo.pop(index)
+        remove_paper_pdf_file(removed)
+        if removed.get("id"):
+            project_db().delete_paper(str(removed["id"]))
+        save_repositories(repositories)
+        return {"total": len(repo)}
+
+    @app.delete("/api/repositories/{repo_id}/items")
+    async def delete_repository_item_by_key(repo_id: str, request: Request) -> dict[str, int]:
+        repo_id = normalize_repo_id(repo_id)
+        paper_id = str(request.query_params.get("paper_id") or "").lower()
+        runtime_log.write(f"Delete repository item requested. repo={repo_id}; paper={paper_id}", "api")
+        repositories = load_repositories()
+        repo = repositories[repo_id]
+        index = next(
+            (
+                i for i, item in enumerate(repo)
+                if candidate_key(item) == paper_id
+                or str(item.get("id") or "").rstrip("/").split("/")[-1].lower() == paper_id
+                or str(item.get("id") or "").lower() == paper_id
+            ),
+            -1,
+        )
+        if index < 0:
+            raise HTTPException(404, "Repository item not found.")
+        removed = repo.pop(index)
+        remove_paper_pdf_file(removed)
+        if removed.get("id"):
+            project_db().delete_paper(str(removed["id"]))
         save_repositories(repositories)
         return {"total": len(repo)}
 
@@ -1393,21 +1601,70 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
         return {"job_id": job.id}
 
     @app.post("/api/open-article-home")
-    async def open_article_home(request: Request) -> dict[str, str]:
-        data = await request.json()
-        value = str(data.get("url") or "").strip()
+    def open_article_home(request: OpenArticleHomeRequest) -> dict[str, str]:
+        value = request.url.strip()
         if not re.match(r"^https?://", value, re.IGNORECASE):
             raise HTTPException(400, "Article URL must be http(s).")
+        job_id = ""
+        repo_id = request.repo_id if request.repo_id in {"repo1", "repo2", "repo3"} else ""
+        if repo_id and request.paper_id:
+            folders = browser_download_dirs()
+            before = pdf_snapshot(folders)
+            started_at = time.time()
+            job = JobState(str(uuid.uuid4()), "browser_import")
+            jobs[job.id] = job
+            job_id = job.id
+            thread = threading.Thread(
+                target=run_browser_download_import_job,
+                args=(job, repo_id, request.paper_id, request.search_job_id, before, started_at),
+                daemon=True,
+            )
+            thread.start()
         os.startfile(value)
-        return {"status": "opened"}
+        return {"status": "opened", "url": value, "job_id": job_id}
 
-    @app.post("/api/repositories/{repo_id}/import-pdf")
-    def import_pdf_to_repository(repo_id: str, request: ImportPdfRequest) -> dict[str, str]:
+    @app.post("/api/repositories/{repo_id}/save-source-pdf")
+    def save_source_pdf_to_repository(repo_id: str, request: SaveSourcePdfRequest) -> dict[str, str]:
         repo_id = normalize_repo_id(repo_id)
-        source = Path(request.pdf_path)
+        source_url = request.source_url.strip()
+        if not re.match(r"^https?://", source_url, re.IGNORECASE):
+            raise HTTPException(400, "Source URL must be http(s).")
+        paper = find_known_paper(request.paper_id, request.search_job_id)
+        if not paper:
+            raise HTTPException(404, "Paper not found in search or repositories.")
+        repo = ensure_paper_in_repository(repo_id, paper)
+        key = candidate_key(paper)
+        target_paper = next((item for item in repo if candidate_key(item) == key), paper)
+        target_paper = dict(target_paper)
+        target_paper["pdf_url"] = source_url
+        target_paper["source_url"] = target_paper.get("source_url") or source_url
+        settings = load_app_settings()
+        path = PdfDownloader(
+            downloads_dir() / repo_id,
+            handoff_first_action_seconds=settings["handoff_first_action_seconds"],
+        ).download(target_paper)
+        updated = dict(target_paper)
+        updated["pdf_path"] = str(path)
+        project_db().upsert_paper(updated)
+
+        repositories = load_repositories()
+        repo = repositories[repo_id]
+        for index, item in enumerate(repo):
+            if candidate_key(item) == key:
+                repo[index] = updated
+                break
+        else:
+            repo.append(updated)
+        save_repositories(repositories)
+        runtime_log.write(f"Saved source PDF to repository. repo={repo_id}; paper={request.paper_id}; path={path}", "api")
+        return {"pdf_path": str(path)}
+
+    def import_pdf_file(repo_id: str, paper_id: str, search_job_id: str, pdf_path: str) -> dict[str, str]:
+        repo_id = normalize_repo_id(repo_id)
+        source = Path(pdf_path)
         if not source.is_file() or source.suffix.lower() != ".pdf":
             raise HTTPException(400, "Please select a valid PDF file.")
-        paper = find_known_paper(request.paper_id, request.search_job_id)
+        paper = find_known_paper(paper_id, search_job_id)
         if not paper:
             raise HTTPException(404, "Paper not found in search or repositories.")
         repo = ensure_paper_in_repository(repo_id, paper)
@@ -1417,11 +1674,13 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
         target_dir.mkdir(parents=True, exist_ok=True)
         title = safe_filename(target_paper.get("title") or source.stem, "paper")
         desired_target = target_dir / f"{title}.pdf"
-        if source.resolve() == desired_target.resolve():
-            target = desired_target
+        source_resolved = source.resolve()
+        target_dir_resolved = target_dir.resolve()
+        if source_resolved == desired_target.resolve() or source_resolved.parent == target_dir_resolved:
+            target = source
         else:
             target = unique_pdf_path(target_dir, title)
-            shutil.move(str(source), str(target))
+            shutil.copy2(str(source), str(target))
         updated = dict(target_paper)
         updated["pdf_path"] = str(target)
         project_db().upsert_paper(updated)
@@ -1435,8 +1694,19 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
         else:
             repo.append(updated)
         save_repositories(repositories)
-        runtime_log.write(f"Imported local PDF by moving file. repo={repo_id}; paper={request.paper_id}; path={target}", "api")
+        runtime_log.write(f"Imported local PDF by copying/registering file. repo={repo_id}; paper={paper_id}; path={target}", "api")
+        emit_client_event({
+            "type": "paper-pdf-imported",
+            "repoId": repo_id,
+            "paperId": paper_id,
+            "pdfPath": str(target),
+            "message": "PDF提取完成",
+        })
         return {"pdf_path": str(target)}
+
+    @app.post("/api/repositories/{repo_id}/import-pdf")
+    def import_pdf_to_repository(repo_id: str, request: ImportPdfRequest) -> dict[str, str]:
+        return import_pdf_file(repo_id, request.paper_id, request.search_job_id, request.pdf_path)
 
     @app.get("/api/jobs/{job_id}")
     def job_status(job_id: str) -> dict[str, Any]:
@@ -1444,6 +1714,13 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
         if not job:
             raise HTTPException(404, "Job not found.")
         return job.snapshot()
+
+    @app.get("/api/client-events")
+    def get_client_events(since: int = 0) -> dict[str, Any]:
+        with client_events_lock:
+            events = [event for event in client_events if int(event.get("id", 0)) > since]
+            latest = int(client_events[-1]["id"]) if client_events else since
+        return {"events": events, "latest": latest}
 
     @app.post("/api/jobs/{job_id}/pause")
     def pause_job(job_id: str) -> dict[str, str]:
@@ -1613,12 +1890,7 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
         opacity: 0.72;
       }}
       .status {{
-        max-width: 260px;
-        color: #475467;
-        font-size: 12px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        display: none;
       }}
     </style>
   </head>
@@ -1630,8 +1902,7 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
         <option value="repo2">仓库 2</option>
         <option value="repo3">仓库 3</option>
       </select>
-      <button id="downloadBtn" type="button">手动下载</button>
-      <button id="homeBtn" class="secondary" type="button">文章首页</button>
+      <button id="browserBtn" class="secondary" type="button">浏览器打开</button>
       <button id="importBtn" class="secondary" type="button">导入PDF</button>
       <span id="status" class="status"></span>
     </div>
@@ -1643,15 +1914,81 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
       const initialRepoId = {safe_repo_id};
       const frame = document.getElementById("sourceFrame");
       const repoSelect = document.getElementById("repoSelect");
-      const downloadBtn = document.getElementById("downloadBtn");
-      const homeBtn = document.getElementById("homeBtn");
+      const browserBtn = document.getElementById("browserBtn");
       const importBtn = document.getElementById("importBtn");
       const statusText = document.getElementById("status");
-      frame.src = sourceUrl;
+      function shouldOpenHomeFirst(url) {{
+        try {{
+          const parsed = new URL(url);
+          return parsed.hostname.toLowerCase().endsWith("mdpi.com") && new RegExp("/pdf/?$", "i").test(parsed.pathname);
+        }} catch (err) {{
+          return false;
+        }}
+      }}
+      frame.src = shouldOpenHomeFirst(sourceUrl) ? homeUrl : sourceUrl;
       if (initialRepoId) repoSelect.value = initialRepoId;
 
       function desktopApi() {{
         return window.pywebview?.api || parent?.pywebview?.api || null;
+      }}
+
+      function publishStatus(message) {{
+        const payload = {{
+          type: "preview-status",
+          message: String(message || ""),
+          paperId,
+          repoId: repoSelect.value,
+        }};
+        try {{
+          new BroadcastChannel("paper-status-events").postMessage(payload);
+        }} catch (err) {{}}
+        try {{
+          localStorage.setItem("paper-preview-status", JSON.stringify({{ ...payload, at: Date.now() }}));
+        }} catch (err) {{}}
+        if (window.parent !== window) {{
+          try {{
+            window.parent.postMessage(payload, window.location.origin);
+          }} catch (err) {{}}
+        }}
+      }}
+      if (shouldOpenHomeFirst(sourceUrl)) {{
+        publishStatus("该站点拒绝副窗口PDF直链，请点击浏览器打开");
+      }}
+
+      function selectPdfFile() {{
+        const pyApi = desktopApi();
+        if (pyApi?.select_pdf_file) return pyApi.select_pdf_file();
+        if (window.parent === window) return Promise.reject(new Error("当前窗口不能打开文件选择框"));
+        return new Promise((resolve, reject) => {{
+          const requestId = `${{Date.now()}}-${{Math.random()}}`;
+          const timer = setTimeout(() => {{
+            window.removeEventListener("message", onMessage);
+            reject(new Error("当前窗口不能打开文件选择框"));
+          }}, 15000);
+          function onMessage(event) {{
+            if (event.origin !== window.location.origin) return;
+            const data = event.data || {{}};
+            if (data.type !== "pdf-file-selected" || data.requestId !== requestId) return;
+            clearTimeout(timer);
+            window.removeEventListener("message", onMessage);
+            if (data.error) reject(new Error(data.error));
+            else resolve(data.selected || {{ path: "" }});
+          }}
+          window.addEventListener("message", onMessage);
+          window.parent.postMessage({{ type: "select-pdf-file", requestId }}, window.location.origin);
+        }});
+      }}
+
+      function syncSourceContext() {{
+        const pyApi = desktopApi();
+        if (pyApi?.set_source_context) {{
+          pyApi.set_source_context(paperId, searchJobId, repoSelect.value).catch(() => {{}});
+        }} else if (window.parent !== window) {{
+          window.parent.postMessage(
+            {{ type: "set-source-context", paperId, searchJobId, repoId: repoSelect.value }},
+            window.location.origin,
+          );
+        }}
       }}
 
       async function api(path, options = {{}}) {{
@@ -1666,73 +2003,89 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
         return response.json();
       }}
 
-      async function pollJob(jobId) {{
+      syncSourceContext();
+      repoSelect.addEventListener("change", syncSourceContext);
+
+      async function pollBrowserImportJob(jobId) {{
+        if (!jobId) return;
         const job = await api(`/api/jobs/${{jobId}}`);
-        statusText.textContent = job.status === "finished"
-          ? "下载完成"
-          : job.status === "error"
-            ? "下载失败"
-            : "下载中...";
-        if (["finished", "error"].includes(job.status)) {{
-          downloadBtn.disabled = false;
+        if (job.status === "finished") {{
+          browserBtn.disabled = false;
+          if (job.downloaded) {{
+            const payload = {{
+              type: "paper-pdf-imported",
+              repoId: repoSelect.value,
+              paperId,
+              pdfPath: "",
+              message: "PDF提取完成",
+            }};
+            try {{
+              new BroadcastChannel("paper-pdf-events").postMessage(payload);
+            }} catch (err) {{}}
+            try {{
+              localStorage.setItem("paper-pdf-imported", JSON.stringify({{ ...payload, at: Date.now() }}));
+            }} catch (err) {{}}
+            if (window.parent !== window) {{
+              try {{
+                window.parent.postMessage(payload, window.location.origin);
+              }} catch (err) {{}}
+            }}
+            publishStatus("PDF提取完成");
+          }} else {{
+            publishStatus("未检测到新的浏览器PDF下载");
+          }}
           return;
         }}
-        setTimeout(() => pollJob(jobId).catch((err) => {{
-          statusText.textContent = err.message;
-          downloadBtn.disabled = false;
-        }}), 1200);
+        if (job.status === "error") {{
+          browserBtn.disabled = false;
+          publishStatus(job.error || "浏览器PDF导入失败");
+          return;
+        }}
+        publishStatus("等待浏览器下载PDF...");
+        setTimeout(() => pollBrowserImportJob(jobId).catch((err) => {{
+          browserBtn.disabled = false;
+          publishStatus(err.message);
+        }}), 1500);
       }}
 
-      downloadBtn.addEventListener("click", async () => {{
-        downloadBtn.disabled = true;
-        statusText.textContent = "准备下载...";
+      browserBtn.addEventListener("click", async () => {{
+        browserBtn.disabled = true;
+        publishStatus("正在用浏览器打开文章首页...");
         try {{
-          const data = await api(`/api/repositories/${{repoSelect.value}}/manual-pdf`, {{
+          const result = await api("/api/open-article-home", {{
             method: "POST",
             body: JSON.stringify({{
+              url: homeUrl,
               search_job_id: searchJobId,
               paper_id: paperId,
+              repo_id: repoSelect.value,
             }}),
           }});
-          statusText.textContent = "下载中...";
-          pollJob(data.job_id);
+          publishStatus("已用浏览器打开文章首页，下载PDF后会自动加入仓库");
+          if (result.job_id) {{
+            pollBrowserImportJob(result.job_id).catch((err) => {{
+              browserBtn.disabled = false;
+              publishStatus(err.message);
+            }});
+          }} else {{
+            browserBtn.disabled = false;
+          }}
         }} catch (err) {{
-          statusText.textContent = err.message;
-          downloadBtn.disabled = false;
-        }}
-      }});
-
-      homeBtn.addEventListener("click", async () => {{
-        homeBtn.disabled = true;
-        statusText.textContent = "正在打开文章首页...";
-        try {{
-          await api("/api/open-article-home", {{
-            method: "POST",
-            body: JSON.stringify({{ url: homeUrl }}),
-          }});
-          statusText.textContent = "已打开文章首页";
-        }} catch (err) {{
-          statusText.textContent = err.message;
-        }} finally {{
-          homeBtn.disabled = false;
+          publishStatus(err.message);
+          browserBtn.disabled = false;
         }}
       }});
 
       importBtn.addEventListener("click", async () => {{
-        const pyApi = desktopApi();
-        if (!pyApi?.select_pdf_file) {{
-          statusText.textContent = "当前窗口不能打开文件选择框";
-          return;
-        }}
         importBtn.disabled = true;
-        statusText.textContent = "请选择PDF文件...";
+        publishStatus("请选择PDF文件...");
         try {{
-          const selected = await pyApi.select_pdf_file();
+          const selected = await selectPdfFile();
           if (!selected?.path) {{
-            statusText.textContent = "未选择PDF";
+            publishStatus("未选择PDF");
             return;
           }}
-          await api(`/api/repositories/${{repoSelect.value}}/import-pdf`, {{
+          const result = await api(`/api/repositories/${{repoSelect.value}}/import-pdf`, {{
             method: "POST",
             body: JSON.stringify({{
               search_job_id: searchJobId,
@@ -1740,9 +2093,21 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
               pdf_path: selected.path,
             }}),
           }});
-          statusText.textContent = "PDF已导入";
+          const payload = {{
+            type: "paper-pdf-imported",
+            repoId: repoSelect.value,
+            paperId,
+            pdfPath: result.pdf_path || "",
+          }};
+          try {{
+            new BroadcastChannel("paper-pdf-events").postMessage(payload);
+          }} catch (err) {{}}
+          try {{
+            localStorage.setItem("paper-pdf-imported", JSON.stringify({{ ...payload, at: Date.now() }}));
+          }} catch (err) {{}}
+          publishStatus("PDF已导入");
         }} catch (err) {{
-          statusText.textContent = err.message;
+          publishStatus(err.message);
         }} finally {{
           importBtn.disabled = false;
         }}
@@ -1859,6 +2224,50 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
       let active = {active_index};
       const tabHost = document.getElementById("tabs");
       const paneHost = document.getElementById("panes");
+      window.addEventListener("message", async (event) => {{
+        if (event.origin !== window.location.origin) return;
+        const data = event.data || {{}};
+        if (data.type === "preview-status") {{
+          try {{
+            new BroadcastChannel("paper-status-events").postMessage(data);
+          }} catch (err) {{}}
+          try {{
+            localStorage.setItem("paper-preview-status", JSON.stringify({{ ...data, at: Date.now() }}));
+          }} catch (err) {{}}
+          return;
+        }}
+        if (data.type === "paper-pdf-imported") {{
+          try {{
+            new BroadcastChannel("paper-pdf-events").postMessage(data);
+          }} catch (err) {{}}
+          try {{
+            localStorage.setItem("paper-pdf-imported", JSON.stringify({{ ...data, at: Date.now() }}));
+          }} catch (err) {{}}
+          return;
+        }}
+        if (data.type === "set-source-context") {{
+          const pyApi = window.pywebview?.api || null;
+          if (pyApi?.set_source_context) {{
+            pyApi.set_source_context(data.paperId || "", data.searchJobId || "", data.repoId || "").catch(() => {{}});
+          }}
+          return;
+        }}
+        if (data.type !== "select-pdf-file") return;
+        const pyApi = window.pywebview?.api || null;
+        try {{
+          if (!pyApi?.select_pdf_file) throw new Error("当前窗口不能打开文件选择框");
+          const selected = await pyApi.select_pdf_file();
+          event.source?.postMessage(
+            {{ type: "pdf-file-selected", requestId: data.requestId, selected }},
+            event.origin,
+          );
+        }} catch (err) {{
+          event.source?.postMessage(
+            {{ type: "pdf-file-selected", requestId: data.requestId, error: err.message || String(err) }},
+            event.origin,
+          );
+        }}
+      }});
       function render() {{
         if (active >= tabs.length) active = Math.max(0, tabs.length - 1);
         tabHost.innerHTML = "";
@@ -1932,7 +2341,13 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
     def index() -> HTMLResponse:
         html_text = (ui_dir / "index.html").read_text(encoding="utf-8")
         repository_summary = {
-            repo_id: [{"key": candidate_key(paper)} for paper in papers]
+            repo_id: [
+                {
+                    "key": candidate_key(public_paper),
+                    "pdf_path": str(public_paper.get("pdf_path") or ""),
+                }
+                for public_paper in public_papers(papers)
+            ]
             for repo_id, papers in load_repositories().items()
         } if active_project_id else {"repo1": [], "repo2": [], "repo3": []}
         publishers_payload = [asdict(item) for item in FAMOUS_OA_PUBLISHERS]
