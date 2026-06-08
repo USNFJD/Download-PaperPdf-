@@ -50,6 +50,10 @@ class AddRepositoryRequest(BaseModel):
     paper_ids: list[str] = Field(default_factory=list)
 
 
+class CopyRepositoryRequest(BaseModel):
+    paper_id: str
+
+
 class DownloadOneRequest(BaseModel):
     search_job_id: str = ""
     paper_id: str
@@ -1511,6 +1515,23 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
 
         save_repositories(repositories)
         return {"added": added, "skipped": skipped, "total": len(repo)}
+
+    @app.post("/api/repositories/{repo_id}/copy")
+    def copy_to_repository(repo_id: str, request: CopyRepositoryRequest) -> dict[str, int]:
+        repo_id = normalize_repo_id(repo_id)
+        paper = find_known_paper(request.paper_id)
+        if not paper:
+            raise HTTPException(404, "Paper is not ready.")
+
+        repositories = load_repositories()
+        repo = repositories[repo_id]
+        key = candidate_key(paper)
+        if key in {candidate_key(item) for item in repo}:
+            return {"added": 0, "skipped": 1, "total": len(repo)}
+
+        repo.append(dict(paper))
+        save_repositories(repositories)
+        return {"added": 1, "skipped": 0, "total": len(repo)}
 
     @app.delete("/api/repositories/{repo_id}/items/{index}")
     def delete_repository_item(repo_id: str, index: int) -> dict[str, int]:

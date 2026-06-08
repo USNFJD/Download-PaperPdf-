@@ -597,7 +597,13 @@ td:nth-child(11) {
 
 .action-cell {
   display: grid;
+  gap: 3px;
+  align-content: center;
   place-items: center;
+}
+
+.action-cell .mini {
+  width: 76px;
 }
 
 .pdf-actions {

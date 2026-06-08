@@ -382,7 +382,10 @@ function renderPapers(papers, mode = "search") {
       const previewTitle = repoSequenceForPaper(paper, index, mode);
       const pdfCell = pdfCellHtml(paper, paperKeyValue, previewTitle);
       const actionCell = mode === "repo"
-        ? `<button class="mini danger" data-delete-paper="${paperKeyValue}">删除</button>`
+        ? `
+          <button class="mini add-repo-btn" type="button" data-copy-repo-paper="${paperKeyValue}">加入仓库</button>
+          <button class="mini danger" data-delete-paper="${paperKeyValue}">删除</button>
+        `
         : `<button class="mini add-repo-btn" type="button" data-add-paper="${paperKeyValue}">加入仓库</button>`;
       const relevance = relevancePercent(paper, renderedPapers);
       const relBg = `hsl(151 52% ${Math.max(32, 92 - relevance * 0.5)}%)`;
@@ -436,6 +439,12 @@ function renderPapers(papers, mode = "search") {
       openRepoPicker(button.dataset.addPaper, button, "add");
     });
   });
+  document.querySelectorAll("[data-copy-repo-paper]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openRepoPicker(button.dataset.copyRepoPaper, button, "copy");
+    });
+  });
 }
 
 async function openPdfPreview(url, title = "") {
@@ -473,7 +482,7 @@ function openRepoPicker(paperKeyValue, anchor, action = "add") {
   picker.querySelectorAll("[data-picker-repo]").forEach((button) => {
     button.disabled = false;
     button.textContent = repoName(button.dataset.pickerRepo);
-    if (action === "add" && paperKeyValue) {
+    if (["add", "copy"].includes(action) && paperKeyValue) {
       const repoKey = `${button.dataset.pickerRepo}:${paperKeyValue}`;
       if (state.repoSequences.has(repoKey)) {
         button.disabled = true;
@@ -616,6 +625,10 @@ async function handleRepoPickerChoice(repoId) {
     closeRepoPicker();
     return;
   }
+  if (state.pickerAction === "copy") {
+    await copyOneToRepository(repoId);
+    return;
+  }
   await addOneToRepository(repoId);
 }
 
@@ -632,6 +645,19 @@ async function addOneToRepository(repoId, paperKeyValue = state.pickerPaperKey) 
   closeRepoPicker();
   await refreshRepositoryState();
   renderPapers(state.searchPapers, "search");
+  const repoText = repoName(repoId);
+  $("statusText").textContent = result.added ? `已加入 ${repoText}` : `这篇已在 ${repoText} 中`;
+}
+
+async function copyOneToRepository(repoId, paperKeyValue = state.pickerPaperKey) {
+  if (!paperKeyValue) return;
+  const result = await api(`/api/repositories/${repoId}/copy`, {
+    method: "POST",
+    body: JSON.stringify({ paper_id: paperKeyValue }),
+  });
+  closeRepoPicker();
+  await refreshRepositoryState();
+  await handleRepoSelectionChange();
   const repoText = repoName(repoId);
   $("statusText").textContent = result.added ? `已加入 ${repoText}` : `这篇已在 ${repoText} 中`;
 }
@@ -1244,6 +1270,7 @@ document.addEventListener("mousedown", (event) => {
     !$("repoPicker").hidden
     && !event.target.closest("#repoPicker")
     && !event.target.closest("[data-add-paper]")
+    && !event.target.closest("[data-copy-repo-paper]")
     && !event.target.closest("#addAllRepoBtn")
   ) {
     closeRepoPicker();
