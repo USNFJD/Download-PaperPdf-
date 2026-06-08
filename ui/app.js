@@ -13,6 +13,7 @@
   sortMode: "relevance",
   sortDirections: { relevance: "desc", date: "desc" },
   pdfFilter: "all",
+  abstractFilter: "all",
   journalFilter: "all",
   quartileFilter: "all",
   sortPickerField: "relevance",
@@ -111,8 +112,18 @@ function relevancePercent(paper, papers) {
 }
 
 function pdfPreviewUrl(paper) {
-  const paperId = (paper.id || "").split("/").filter(Boolean).pop();
+  const paperId = paperShortId(paper);
   if (paper.pdf_path && paperId) return `/api/pdf-preview/${encodeURIComponent(paperId)}`;
+  return "";
+}
+
+function paperShortId(paper) {
+  return (paper.id || paper.doi || paper.pdf_url || "").split("/").filter(Boolean).pop() || "";
+}
+
+function figurePreviewUrl(paper) {
+  const paperId = paperShortId(paper);
+  if (paper.pdf_path && paperId) return `/figure-preview/${encodeURIComponent(paperId)}`;
   return "";
 }
 
@@ -126,9 +137,16 @@ function repoSequenceForPaper(paper, renderedIndex, mode) {
 function pdfCellHtml(paper, paperKeyValue, previewTitle) {
   const actions = [];
   const previewUrl = pdfPreviewUrl(paper);
+  const figuresUrl = figurePreviewUrl(paper);
   if (previewUrl) {
     actions.push(
       `<button class="mini preview-btn" type="button" data-preview-url="${escapeAttr(previewUrl)}" data-preview-title="${escapeAttr(previewTitle)}" data-paper-key="${paperKeyValue}">预览</button>`,
+    );
+  }
+  if (figuresUrl) {
+    const figureCount = Number(paper.figure_count || 0);
+    actions.push(
+      `<button class="mini figure-btn" type="button" data-figure-url="${escapeAttr(figuresUrl)}" data-preview-title="${escapeAttr(previewTitle)}">图片(${figureCount})</button>`,
     );
   }
   if (!previewUrl && paper.pdf_url) {
@@ -146,6 +164,16 @@ function applyPdfFilter(papers) {
   if (state.pdfFilter === "local") return papers.filter((paper) => paper.pdf_path);
   if (state.pdfFilter === "source") return papers.filter((paper) => paper.pdf_url);
   if (state.pdfFilter === "none") return papers.filter((paper) => !paper.pdf_path && !paper.pdf_url);
+  return papers;
+}
+
+function hasAbstract(paper) {
+  return Boolean(String(paper.abstract || "").trim());
+}
+
+function applyAbstractFilter(papers) {
+  if (state.abstractFilter === "has") return papers.filter(hasAbstract);
+  if (state.abstractFilter === "none") return papers.filter((paper) => !hasAbstract(paper));
   return papers;
 }
 
@@ -331,6 +359,7 @@ function applyProjectGate() {
     "titleSearchBtn",
     "addRepoBtn",
     "downloadRepoBtn",
+    "extractFiguresBtn",
     "openRepoFolderBtn",
     "reloadQuartileBtn",
     "openFolderBtn",
@@ -373,7 +402,7 @@ function renderPapers(papers, mode = "search") {
   state.mode = mode;
   state.renderSourcePapers = [...papers];
   const sortedPapers = sortPapers(papers);
-  state.currentPapers = applyJournalFilter(applyQuartileFilter(applyPdfFilter(sortedPapers)));
+  state.currentPapers = applyJournalFilter(applyQuartileFilter(applyAbstractFilter(applyPdfFilter(sortedPapers))));
   const renderedPapers = state.currentPapers;
   $("paperRows").innerHTML = renderedPapers
     .map((paper, index) => {
@@ -425,6 +454,12 @@ function renderPapers(papers, mode = "search") {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
       openPdfPreview(button.dataset.previewUrl, button.dataset.previewTitle);
+    });
+  });
+  document.querySelectorAll("[data-figure-url]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openPdfPreview(button.dataset.figureUrl, `${button.dataset.previewTitle || ""} 图片`);
     });
   });
   document.querySelectorAll(".source-btn").forEach((button) => {
@@ -529,10 +564,32 @@ function openPdfFilterPicker(anchor) {
   picker.style.top = `${top}px`;
 }
 
+function openAbstractFilterPicker(anchor) {
+  const picker = $("abstractFilterPicker");
+  const papers = applyQuartileFilter(applyJournalFilter(applyPdfFilter(state.renderSourcePapers.length ? state.renderSourcePapers : state.searchPapers)));
+  const counts = {
+    has: papers.filter(hasAbstract).length,
+    none: papers.filter((paper) => !hasAbstract(paper)).length,
+    all: papers.length,
+  };
+  picker.querySelectorAll("[data-abstract-filter]").forEach((button) => {
+    const labels = { has: "有摘要", none: "无摘要", all: "显示全部" };
+    const key = button.dataset.abstractFilter;
+    button.textContent = `${labels[key]} (${counts[key] || 0})`;
+  });
+  picker.hidden = false;
+  const rect = anchor.getBoundingClientRect();
+  const width = 168;
+  const left = Math.max(12, Math.min(window.innerWidth - width - 12, rect.right - width));
+  const top = Math.max(12, Math.min(window.innerHeight - 138, rect.bottom + 6));
+  picker.style.left = `${left}px`;
+  picker.style.top = `${top}px`;
+}
+
 function openJournalFilterPicker(anchor) {
   const picker = $("journalFilterPicker");
   const host = $("journalFilterOptions");
-  const papers = applyQuartileFilter(applyPdfFilter(state.renderSourcePapers.length ? state.renderSourcePapers : state.searchPapers));
+  const papers = applyQuartileFilter(applyAbstractFilter(applyPdfFilter(state.renderSourcePapers.length ? state.renderSourcePapers : state.searchPapers)));
   const counts = new Map();
   papers.forEach((paper) => {
     const journal = String(paper.journal || "未记录");
@@ -558,7 +615,7 @@ function openJournalFilterPicker(anchor) {
 
 function openQuartileFilterPicker(anchor) {
   const picker = $("quartileFilterPicker");
-  const papers = applyJournalFilter(applyPdfFilter(state.renderSourcePapers.length ? state.renderSourcePapers : state.searchPapers));
+  const papers = applyJournalFilter(applyAbstractFilter(applyPdfFilter(state.renderSourcePapers.length ? state.renderSourcePapers : state.searchPapers)));
   const counts = { Q1: 0, Q2: 0, Q3: 0, Q4: 0, other: 0, all: papers.length };
   papers.forEach((paper) => {
     const quartile = paperQuartile(paper);
@@ -596,9 +653,20 @@ function closePdfFilterPicker() {
   if (picker) picker.hidden = true;
 }
 
+function closeAbstractFilterPicker() {
+  const picker = $("abstractFilterPicker");
+  if (picker) picker.hidden = true;
+}
+
 function setPdfFilter(filter) {
   state.pdfFilter = ["local", "source", "none", "all"].includes(filter) ? filter : "all";
   closePdfFilterPicker();
+  renderPapers(state.mode === "repo" ? state.renderSourcePapers : state.searchPapers, state.mode);
+}
+
+function setAbstractFilter(filter) {
+  state.abstractFilter = ["has", "none", "all"].includes(filter) ? filter : "all";
+  closeAbstractFilterPicker();
   renderPapers(state.mode === "repo" ? state.renderSourcePapers : state.searchPapers, state.mode);
 }
 
@@ -883,7 +951,7 @@ async function addAllSearchToRepository(repoId) {
     alert("请选择仓库 1、2 或 3。");
     return;
   }
-  const paperIds = applyJournalFilter(applyQuartileFilter(applyPdfFilter(sortPapers(state.searchPapers)))).map((paper) => normalizedPaperKey(paper)).filter(Boolean);
+  const paperIds = applyJournalFilter(applyQuartileFilter(applyAbstractFilter(applyPdfFilter(sortPapers(state.searchPapers))))).map((paper) => normalizedPaperKey(paper)).filter(Boolean);
   if (!paperIds.length) {
     alert("当前筛选下没有可加入的文献。");
     return;
@@ -1128,6 +1196,13 @@ function readableStatus(job) {
     if (job.status === "manual_pdf") return "正在打开并保存这篇 PDF";
     if (job.status === "error") return "这篇下载失败，请查看日志";
   }
+  if (job.kind === "extract_figures") {
+    const done = (job.downloaded || 0) + (job.failed || 0);
+    const total = job.total || job.target || 0;
+    if (job.status === "finished") return `图片提取完成：处理 ${job.downloaded || 0}/${total} 个 PDF，失败 ${job.failed || 0} 个`;
+    if (job.status === "extracting_figures") return `正在提取图片：${done}/${total}`;
+    if (job.status === "error") return "图片提取失败，请查看日志";
+  }
   return job.status || "处理中";
 }
 
@@ -1137,8 +1212,13 @@ function readableLog(line) {
   if (/Keywords:/.test(text)) return `检索关键词：${text.split("Keywords:").pop().trim()}`;
   if (/Search ready: showing (\d+)/.test(text)) return `检索完成，显示 ${RegExp.$1} 篇候选文献。`;
   if (/Search failed|Search job error/.test(text)) return `检索遇到问题：${humanError(text)}`;
+  if (/补全摘要/.test(text)) return text;
   if (/Download finished:/.test(text)) return humanError(text);
   if (/Manual PDF download error|Download job error/.test(text)) return `下载失败：${humanError(text)}`;
+  if (/Figure extraction started:/.test(text)) return humanError(text).replace("Figure extraction started:", "图片提取开始：");
+  if (/Figure extraction finished:/.test(text)) return humanError(text).replace("Figure extraction finished:", "图片提取完成：");
+  if (/Extracting figures (\d+)\/(\d+):/.test(text)) return text.replace(/Extracting figures (\d+)\/(\d+):/, "正在提取图片 $1/$2：");
+  if (/figure extraction failed|Figure extraction job error/i.test(text)) return `图片提取失败：${humanError(text)}`;
   return humanError(text);
 }
 
@@ -1174,6 +1254,8 @@ async function refreshJob() {
     setProgress(Math.min(job.searched || job.total || 0, job.target || 0), job.target || Number($("maxPapers").value || 100), "检索");
   } else if (["download", "manual_pdf"].includes(job.kind)) {
     setProgress((job.downloaded || 0) + (job.failed || 0) + (job.skipped || 0), job.target || job.total || 0, "下载");
+  } else if (job.kind === "extract_figures") {
+    setProgress((job.downloaded || 0) + (job.failed || 0), job.target || job.total || 0, "图片");
   }
   $("downloadedText").textContent = `${job.downloaded}/${job.total || job.target || 0}`;
   $("failedText").textContent = job.failed;
@@ -1200,10 +1282,21 @@ async function refreshJob() {
     clearInterval(state.timer);
   }
 
+  if (job.kind === "extract_figures" && ["finished", "error"].includes(job.status)) {
+    $("searchBtn").disabled = false;
+    $("titleSearchBtn").disabled = false;
+    $("downloadRepoBtn").disabled = false;
+    $("extractFiguresBtn").disabled = false;
+    applyProjectGate();
+    await loadSelectedRecord();
+    clearInterval(state.timer);
+  }
+
   if (job.status === "error") {
     $("searchBtn").disabled = false;
     $("titleSearchBtn").disabled = false;
     $("downloadRepoBtn").disabled = false;
+    $("extractFiguresBtn").disabled = false;
     applyProjectGate();
     clearInterval(state.timer);
   }
@@ -1227,17 +1320,41 @@ async function openDownloads() {
   await api("/api/open-downloads", { method: "POST" });
 }
 
+async function extractFigures() {
+  if (!ensureProjectSelected()) return;
+  const button = $("extractFiguresBtn");
+  const repoId = $("repoSelect").value;
+  const targetRepo = ["repo1", "repo2", "repo3"].includes(repoId) ? repoId : "all";
+  button.disabled = true;
+  $("statusText").textContent = targetRepo === "all" ? "正在提取全部仓库图片" : `正在提取${repoLabel()}图片`;
+  try {
+    const result = await api("/api/extract-figures", {
+      method: "POST",
+      body: JSON.stringify({ repo_id: targetRepo }),
+    });
+    state.activeJobId = result.job_id;
+    setProgress(0, 0, "图片");
+    startPolling();
+  } catch (err) {
+    button.disabled = false;
+    applyProjectGate();
+    throw err;
+  }
+}
+
 $("searchBtn").addEventListener("click", () => handleSearchButton().catch((err) => alert(err.message)));
 $("titleSearchBtn").addEventListener("click", () => handleTitleSearchButton().catch((err) => alert(err.message)));
 $("addRepoBtn").addEventListener("click", () => addSelectedToRepository().catch((err) => alert(err.message)));
 $("loadRepoBtn").addEventListener("click", (event) => openProjectPicker(event.currentTarget));
 $("downloadRepoBtn").addEventListener("click", () => downloadRepository().catch((err) => alert(err.message)));
+$("extractFiguresBtn").addEventListener("click", () => extractFigures().catch((err) => alert(err.message)));
 $("openRepoFolderBtn").addEventListener("click", () => openRepositoryDownloads().catch((err) => alert(err.message)));
 $("newProjectBtn").addEventListener("click", () => createProject().catch((err) => alert(err.message)));
 $("selectProjectBtn").addEventListener("click", () => chooseProject().catch((err) => alert(err.message)));
 $("sortRelevanceBtn").addEventListener("click", () => sortCurrentSearch("relevance"));
 $("sortDateBtn").addEventListener("click", (event) => openSortPicker("date", event.currentTarget));
 $("sortRelevanceValueBtn").addEventListener("click", (event) => openSortPicker("relevance", event.currentTarget));
+$("abstractFilterBtn").addEventListener("click", (event) => openAbstractFilterPicker(event.currentTarget));
 $("pdfFilterBtn").addEventListener("click", (event) => openPdfFilterPicker(event.currentTarget));
 $("journalFilterBtn").addEventListener("click", (event) => openJournalFilterPicker(event.currentTarget));
 $("quartileFilterBtn").addEventListener("click", (event) => openQuartileFilterPicker(event.currentTarget));
@@ -1258,6 +1375,9 @@ document.querySelectorAll("[data-picker-repo]").forEach((button) => {
 });
 document.querySelectorAll("[data-pdf-filter]").forEach((button) => {
   button.addEventListener("click", () => setPdfFilter(button.dataset.pdfFilter));
+});
+document.querySelectorAll("[data-abstract-filter]").forEach((button) => {
+  button.addEventListener("click", () => setAbstractFilter(button.dataset.abstractFilter));
 });
 document.querySelectorAll("[data-quartile-filter]").forEach((button) => {
   button.addEventListener("click", () => setQuartileFilter(button.dataset.quartileFilter));
@@ -1288,6 +1408,13 @@ document.addEventListener("mousedown", (event) => {
     && !event.target.closest("#pdfFilterBtn")
   ) {
     closePdfFilterPicker();
+  }
+  if (
+    !$("abstractFilterPicker").hidden
+    && !event.target.closest("#abstractFilterPicker")
+    && !event.target.closest("#abstractFilterBtn")
+  ) {
+    closeAbstractFilterPicker();
   }
   if (
     !$("journalFilterPicker").hidden

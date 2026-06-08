@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PaperPdf-MarLous</title>
     <link rel="icon" href="/assets/MarLous.png" />
-    <link rel="stylesheet" href="/assets/style.css?v=20260608-quartile-filter" />
+    <link rel="stylesheet" href="/assets/style.css?v=20260608-figures" />
   </head>
   <body>
     <div class="shell">
@@ -88,7 +88,8 @@
               <button id="addRepoBtn" disabled hidden>添加勾选</button>
               <button id="loadRepoBtn">项目</button>
               <button id="downloadRepoBtn">下载仓库</button>
-              <button id="openRepoFolderBtn">仓库文件</button>
+              <button id="extractFiguresBtn">提取图片</button>
+              <button id="openRepoFolderBtn">仓库</button>
             </div>
           </div>
         </section>
@@ -127,7 +128,7 @@
                   <th>序号</th>
                   <th><button class="th-sort" id="sortRelevanceBtn" type="button">文献名称</button></th>
                   <th>作者</th>
-                  <th>摘要</th>
+                  <th><button class="th-sort" id="abstractFilterBtn" type="button">摘要</button></th>
                   <th><button class="th-sort" id="sortDateBtn" type="button">发表时间</button></th>
                   <th><button class="th-sort" id="sortRelevanceValueBtn" type="button">关联度</button></th>
                   <th>所在仓库</th>
@@ -161,6 +162,12 @@
       <button type="button" data-pdf-filter="none">无源</button>
       <button type="button" data-pdf-filter="all">显示全部</button>
     </div>
+    <div id="abstractFilterPicker" class="repo-picker abstract-filter-picker" hidden>
+      <div class="repo-picker-title">摘要筛选</div>
+      <button type="button" data-abstract-filter="has">有摘要</button>
+      <button type="button" data-abstract-filter="none">无摘要</button>
+      <button type="button" data-abstract-filter="all">显示全部</button>
+    </div>
     <div id="journalFilterPicker" class="repo-picker journal-filter-picker" hidden>
       <div class="repo-picker-title">期刊筛选</div>
       <div id="journalFilterOptions"></div>
@@ -179,6 +186,6 @@
       <button type="button" data-sort-direction="asc">正序</button>
       <button type="button" data-sort-direction="desc">倒序</button>
     </div>
-    <script src="/assets/app.js?v=20260608-quartile-filter"></script>
+    <script src="/assets/app.js?v=20260608-figures"></script>
   </body>
 </html>

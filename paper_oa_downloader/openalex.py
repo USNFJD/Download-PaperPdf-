@@ -1,9 +1,11 @@
 ﻿from __future__ import annotations
 
 import math
+import re
 import time
 from datetime import date
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -13,6 +15,8 @@ from . import runtime_log
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 OPENALEX_PUBLISHERS_URL = "https://api.openalex.org/publishers"
 OPENALEX_SOURCES_URL = "https://api.openalex.org/sources"
+CROSSREF_WORKS_URL = "https://api.crossref.org/works"
+SEMANTIC_SCHOLAR_PAPER_URL = "https://api.semanticscholar.org/graph/v1/paper"
 
 
 def reconstruct_abstract(index: dict[str, list[int]] | None) -> str:
@@ -24,6 +28,16 @@ def reconstruct_abstract(index: dict[str, list[int]] | None) -> str:
             positions.append((offset, word))
     positions.sort()
     return " ".join(word for _, word in positions)
+
+
+def clean_abstract(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    text = re.sub(r"</?(?:jats:)?(?:p|sec|title|italic|bold|sub|sup|xref|break|inline-formula|disp-formula)[^>]*>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def first_pdf_url(work: dict[str, Any]) -> str:
@@ -97,6 +111,11 @@ class OpenAlexClient:
                 "Accept": "application/json",
             }
         )
+        self.abstract_cache: dict[str, str] = {}
+
+    def normalize_doi(self, doi: str) -> str:
+        clean_doi = str(doi or "").strip()
+        return re.sub(r"^https?://(?:dx\.)?doi\.org/", "", clean_doi, flags=re.I)
 
     def search(
         self,
@@ -180,6 +199,83 @@ class OpenAlexClient:
             "openalex",
         )
         return candidates
+
+    def crossref_abstract(self, doi: str) -> str:
+        clean_doi = self.normalize_doi(doi)
+        if not clean_doi:
+            return ""
+        key = f"crossref:{clean_doi.casefold()}"
+        if key in self.abstract_cache:
+            return self.abstract_cache[key]
+        params: dict[str, Any] = {}
+        if self.mailto:
+            params["mailto"] = self.mailto
+        try:
+            response = self.session.get(
+                f"{CROSSREF_WORKS_URL}/{quote(clean_doi, safe='')}",
+                params=params,
+                timeout=8,
+            )
+            if response.status_code == 404:
+                self.abstract_cache[key] = ""
+                return ""
+            response.raise_for_status()
+            message = (response.json() or {}).get("message") or {}
+            abstract = clean_abstract(message.get("abstract"))
+        except Exception as exc:
+            runtime_log.write(f"Crossref abstract lookup ignored. doi={clean_doi}; error={exc}", "openalex")
+            abstract = ""
+        self.abstract_cache[key] = abstract
+        return abstract
+
+    def semantic_scholar_abstract(self, doi: str) -> str:
+        clean_doi = self.normalize_doi(doi)
+        if not clean_doi:
+            return ""
+        key = f"semantic:{clean_doi.casefold()}"
+        if key in self.abstract_cache:
+            return self.abstract_cache[key]
+        try:
+            response = self.session.get(
+                f"{SEMANTIC_SCHOLAR_PAPER_URL}/DOI:{quote(clean_doi, safe='')}",
+                params={"fields": "abstract"},
+                timeout=8,
+            )
+            if response.status_code in {404, 429}:
+                self.abstract_cache[key] = ""
+                return ""
+            response.raise_for_status()
+            abstract = clean_abstract((response.json() or {}).get("abstract"))
+        except Exception as exc:
+            runtime_log.write(f"Semantic Scholar abstract lookup ignored. doi={clean_doi}; error={exc}", "openalex")
+            abstract = ""
+        self.abstract_cache[key] = abstract
+        return abstract
+
+    def fallback_abstract(self, doi: str) -> str:
+        return self.crossref_abstract(doi) or self.semantic_scholar_abstract(doi)
+
+    def enrich_missing_abstracts(self, papers: list[dict[str, Any]], progress=None, limit: int = 80) -> None:
+        targets = [
+            paper
+            for paper in papers
+            if not str(paper.get("abstract") or "").strip() and str(paper.get("doi") or "").strip()
+        ][: max(0, limit)]
+        if not targets:
+            return
+        filled = 0
+        if progress:
+            progress(f"补全摘要：正在从 Crossref / Semantic Scholar 尝试补齐 {len(targets)} 篇缺失摘要。")
+        for index, paper in enumerate(targets, start=1):
+            abstract = self.fallback_abstract(str(paper.get("doi") or ""))
+            if abstract:
+                paper["abstract"] = abstract
+                filled += 1
+            if progress and (index == len(targets) or index % 10 == 0):
+                progress(f"补全摘要进度：{index}/{len(targets)}，已补齐 {filled} 篇。")
+            time.sleep(0.03)
+        if progress:
+            progress(f"补全摘要完成：已补齐 {filled}/{len(targets)} 篇。")
 
     def search_title_quick(
         self,

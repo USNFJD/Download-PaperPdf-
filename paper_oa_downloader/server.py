@@ -11,10 +11,12 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
@@ -235,6 +237,304 @@ def normalize_repo_id(repo_id: str) -> str:
     if repo_id not in {"repo1", "repo2", "repo3"}:
         raise HTTPException(404, "Repository not found.")
     return repo_id
+
+
+def short_safe_filename(value: str, fallback: str = "paper", max_length: int = 90) -> str:
+    return safe_filename(value, fallback)[:max_length].strip(" .") or fallback
+
+
+def rect_area(rect: Any) -> float:
+    return max(0.0, float(rect.x1 - rect.x0)) * max(0.0, float(rect.y1 - rect.y0))
+
+
+def caption_candidates(page: Any) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    try:
+        blocks = page.get_text("blocks")
+    except Exception:
+        return candidates
+    pattern = re.compile(
+        r"^\s*((?:Fig(?:ure)?\.?|图|圖)\s*[\dIVXivx]+[A-Za-z0-9().-]*)\s*[:：.)-]?\s*(.{0,160})",
+        re.I,
+    )
+    for block in blocks:
+        if len(block) < 5:
+            continue
+        text = re.sub(r"\s+", " ", str(block[4] or "")).strip()
+        match = pattern.match(text)
+        if not match:
+            continue
+        label = re.sub(r"^Figure", "Fig", match.group(1), flags=re.I).strip()
+        title = f"{label} {match.group(2).strip()}".strip()
+        if len(title) > 170:
+            continue
+        if len(title.split()) > 28:
+            continue
+        candidates.append({"bbox": tuple(float(value) for value in block[:4]), "text": title})
+    return candidates
+
+
+def valid_body_image_rect(rect: Any, page_rect: Any) -> bool:
+    width = float(rect.x1 - rect.x0)
+    height = float(rect.y1 - rect.y0)
+    if width < 70 or height < 70:
+        return False
+    if rect_area(rect) < 9000:
+        return False
+    page_height = float(page_rect.height)
+    page_width = float(page_rect.width)
+    if rect.y0 < page_height * 0.10 and height < page_height * 0.18:
+        return False
+    if rect.y1 > page_height * 0.94 and height < page_height * 0.16:
+        return False
+    if rect.x0 < page_width * 0.04 and width < page_width * 0.18:
+        return False
+    return True
+
+
+def rect_distance(a: Any, b: Any) -> float:
+    horizontal = max(float(b.x0 - a.x1), float(a.x0 - b.x1), 0.0)
+    vertical = max(float(b.y0 - a.y1), float(a.y0 - b.y1), 0.0)
+    return (horizontal**2 + vertical**2) ** 0.5
+
+
+def group_image_rects(rects: list[Any], fitz_module: Any) -> list[Any]:
+    groups: list[Any] = []
+    for rect in sorted(rects, key=lambda item: (float(item.y0), float(item.x0))):
+        for index, group in enumerate(groups):
+            expanded = fitz_module.Rect(group)
+            expanded.x0 -= 45
+            expanded.x1 += 45
+            expanded.y0 -= 35
+            expanded.y1 += 35
+            if expanded.intersects(rect) or rect_distance(group, rect) < 70:
+                groups[index] = group | rect
+                break
+        else:
+            groups.append(fitz_module.Rect(rect))
+
+    changed = True
+    while changed:
+        changed = False
+        next_groups: list[Any] = []
+        for group in groups:
+            for index, other in enumerate(next_groups):
+                expanded = fitz_module.Rect(other)
+                expanded.x0 -= 45
+                expanded.x1 += 45
+                expanded.y0 -= 35
+                expanded.y1 += 35
+                if expanded.intersects(group) or rect_distance(other, group) < 70:
+                    next_groups[index] = other | group
+                    changed = True
+                    break
+            else:
+                next_groups.append(group)
+        groups = next_groups
+    return groups
+
+
+def nearest_caption(rect: Any, candidates: list[dict[str, Any]]) -> tuple[str, dict[str, Any], float] | None:
+    best: tuple[float, str, dict[str, Any]] | None = None
+    image_center_x = (float(rect.x0) + float(rect.x1)) / 2
+    for candidate in candidates:
+        c0, cy0, c2, cy1 = candidate["bbox"]
+        caption_center_x = (c0 + c2) / 2
+        vertical_gap = min(abs(cy0 - float(rect.y1)), abs(float(rect.y0) - cy1))
+        horizontal_gap = abs(image_center_x - caption_center_x) * 0.25
+        below_bonus = -35 if cy0 >= float(rect.y0) else 0
+        score = vertical_gap + horizontal_gap + below_bonus
+        if best is None or score < best[0]:
+            best = (score, candidate["text"], candidate)
+    return (best[1], best[2], best[0]) if best else None
+
+
+def figure_clip(rect: Any, caption: dict[str, Any] | None, page_rect: Any, fitz_module: Any) -> Any:
+    clip = fitz_module.Rect(rect)
+    clip.x0 -= 10
+    clip.x1 += 10
+    clip.y0 -= 10
+    clip.y1 += 10
+    if caption:
+        clip |= fitz_module.Rect(caption["bbox"])
+    clip.x0 = max(float(page_rect.x0), clip.x0)
+    clip.y0 = max(float(page_rect.y0), clip.y0)
+    clip.x1 = min(float(page_rect.x1), clip.x1)
+    clip.y1 = min(float(page_rect.y1), clip.y1)
+    return clip
+
+
+def horizontal_overlap_ratio(a: Any, b: Any) -> float:
+    overlap = max(0.0, min(float(a.x1), float(b.x1)) - max(float(a.x0), float(b.x0)))
+    return overlap / max(1.0, min(float(a.x1 - a.x0), float(b.x1 - b.x0)))
+
+
+def valid_drawing_rect(rect: Any, page_rect: Any) -> bool:
+    width = float(rect.x1 - rect.x0)
+    height = float(rect.y1 - rect.y0)
+    if width < 55 or height < 35:
+        return False
+    if rect_area(rect) < 3500:
+        return False
+    if rect_area(rect) > rect_area(page_rect) * 0.72:
+        return False
+    return True
+
+
+def drawing_rects(page: Any, page_rect: Any, fitz_module: Any) -> list[Any]:
+    rects: list[Any] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return rects
+    for drawing in drawings:
+        rect = drawing.get("rect") if isinstance(drawing, dict) else None
+        if not rect:
+            continue
+        item = fitz_module.Rect(rect)
+        if valid_drawing_rect(item, page_rect):
+            rects.append(item)
+    return rects
+
+
+def caption_vector_clip(caption: dict[str, Any], vectors: list[Any], page_rect: Any, fitz_module: Any) -> Any | None:
+    caption_rect = fitz_module.Rect(caption["bbox"])
+    page_height = float(page_rect.height)
+    nearby: list[Any] = []
+    for rect in vectors:
+        vertical_gap = min(abs(float(caption_rect.y0 - rect.y1)), abs(float(rect.y0 - caption_rect.y1)))
+        if vertical_gap > page_height * 0.22:
+            continue
+        if rect.y0 > caption_rect.y1 + page_height * 0.08:
+            continue
+        if horizontal_overlap_ratio(rect, caption_rect) < 0.18 and rect_distance(rect, caption_rect) > 90:
+            continue
+        nearby.append(rect)
+    if not nearby:
+        return None
+
+    groups = group_image_rects(nearby, fitz_module)
+    group = min(groups, key=lambda item: rect_distance(item, caption_rect))
+    if rect_area(group) < rect_area(page_rect) * 0.025:
+        return None
+    clip = figure_clip(group, caption, page_rect, fitz_module)
+    return clip
+
+
+def clip_text_too_dense(page: Any, clip: Any) -> bool:
+    try:
+        text = re.sub(r"\s+", " ", page.get_text("text", clip=clip) or "").strip()
+    except Exception:
+        return False
+    if len(text) <= 220:
+        return False
+    return len(text) / max(1.0, rect_area(clip)) > 0.0018
+
+
+def clip_overlaps_existing(candidate: Any, existing: list[Any]) -> bool:
+    for rect in existing:
+        overlap = candidate & rect
+        if not overlap.is_empty and rect_area(overlap) > min(rect_area(candidate), rect_area(rect)) * 0.35:
+            return True
+    return False
+
+
+def save_figure_clip(
+    page: Any,
+    clip: Any,
+    caption_text: str,
+    fallback: str,
+    output_dir: Path,
+    used_names: dict[str, int],
+    fitz_module: Any,
+) -> None:
+    base = short_safe_filename(caption_text, fallback, max_length=56)
+    used_names[base] += 1
+    suffix = f"-{used_names[base]}" if used_names[base] > 1 else ""
+    target = output_dir / f"{base}{suffix}.png"
+    pixmap = page.get_pixmap(matrix=fitz_module.Matrix(2, 2), clip=clip, alpha=False)
+    pixmap.save(target)
+
+
+def extract_pdf_figures(pdf_path: Path, output_dir: Path) -> dict[str, Any]:
+    import fitz
+
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    skipped = 0
+    used_names: dict[str, int] = defaultdict(int)
+
+    with fitz.open(pdf_path) as document:
+        for page_index, page in enumerate(document, start=1):
+            page_rect = page.rect
+            captions = caption_candidates(page)
+            raw_rects: list[Any] = []
+            vector_rects = drawing_rects(page, page_rect, fitz)
+            for image_info in page.get_images(full=True):
+                for rect in page.get_image_rects(int(image_info[0])):
+                    if valid_body_image_rect(rect, page_rect):
+                        raw_rects.append(fitz.Rect(rect))
+                    else:
+                        skipped += 1
+
+            for image_no, group in enumerate(group_image_rects(raw_rects, fitz), start=1):
+                caption_match = nearest_caption(group, captions)
+                if caption_match:
+                    caption_text, caption, caption_score = caption_match
+                else:
+                    caption_text = f"page-{page_index:03d}-image-{image_no:02d}"
+                    caption = None
+                    caption_score = 9999
+
+                if page_index <= 2 and caption is None:
+                    skipped += 1
+                    continue
+                if caption is None and rect_area(group) < rect_area(page_rect) * 0.08:
+                    skipped += 1
+                    continue
+                if caption_score > 260 and page_index <= 3:
+                    skipped += 1
+                    continue
+
+                clip = figure_clip(group, caption, page_rect, fitz)
+                save_figure_clip(
+                    page,
+                    clip,
+                    caption_text,
+                    f"page-{page_index:03d}-image-{image_no:02d}",
+                    output_dir,
+                    used_names,
+                    fitz,
+                )
+                saved += 1
+
+            for caption_no, caption in enumerate(captions, start=1):
+                clip = caption_vector_clip(caption, vector_rects, page_rect, fitz)
+                if not clip:
+                    skipped += 1
+                    continue
+                if clip_overlaps_existing(clip, raw_rects):
+                    continue
+                if rect_area(clip) < rect_area(page_rect) * 0.035:
+                    skipped += 1
+                    continue
+                if clip_text_too_dense(page, clip):
+                    skipped += 1
+                    continue
+                save_figure_clip(
+                    page,
+                    clip,
+                    str(caption.get("text") or f"page-{page_index:03d}-caption-{caption_no:02d}"),
+                    f"page-{page_index:03d}-caption-{caption_no:02d}",
+                    output_dir,
+                    used_names,
+                    fitz,
+                )
+                saved += 1
+
+    return {"saved": saved, "skipped": skipped, "output_dir": str(output_dir), "mode": "rendered-regions"}
 
 
 def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
@@ -589,9 +889,39 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
                 break
         return paper
 
+    def paper_short_id(paper: dict[str, Any]) -> str:
+        value = str(paper.get("id") or paper.get("doi") or paper.get("pdf_url") or paper.get("title") or "")
+        short = value.rstrip("/").split("/")[-1]
+        cleaned = short_safe_filename(short, "", max_length=42)
+        if cleaned:
+            return cleaned
+        return base64.urlsafe_b64encode(value.encode("utf-8", errors="ignore")).decode("ascii").rstrip("=")[:24] or "paper"
+
+    def figure_root() -> Path:
+        data_path, _ = project_paths()
+        return data_path / "extracted_figures"
+
+    def figure_folder_for_paper(paper: dict[str, Any]) -> Path:
+        paper = attach_downloaded_pdf(dict(paper))
+        pdf_path = Path(str(paper.get("pdf_path") or ""))
+        title = short_safe_filename(str(paper.get("title") or pdf_path.stem), pdf_path.stem or "paper", max_length=72)
+        return figure_root() / f"{paper_short_id(paper)}-{title}"
+
+    def figure_count_for_paper(paper: dict[str, Any]) -> int:
+        folder = figure_folder_for_paper(paper)
+        if not folder.exists():
+            return 0
+        allowed = {".png", ".jpg", ".jpeg", ".jpe", ".jp2", ".bmp", ".tif", ".tiff", ".webp"}
+        return sum(1 for path in folder.iterdir() if path.is_file() and path.suffix.lower() in allowed)
+
     def public_papers(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
         pdf_paths = downloaded_pdf_map()
-        return [paper_public_view(attach_downloaded_pdf(dict(item), pdf_paths)) for item in papers]
+        public: list[dict[str, Any]] = []
+        for item in papers:
+            paper = paper_public_view(attach_downloaded_pdf(dict(item), pdf_paths))
+            paper["figure_count"] = figure_count_for_paper(paper) if paper.get("pdf_path") else 0
+            public.append(paper)
+        return public
 
     def find_known_paper(paper_id: str, search_job_id: str = "") -> dict[str, Any] | None:
         key = paper_id.lower()
@@ -603,9 +933,152 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
         sources.append(project_db().list_papers(limit=10000))
         for papers in sources:
             for item in papers:
-                if candidate_key(item) == key or (item.get("id") or "").rstrip("/").split("/")[-1].lower() == key:
+                known_keys = {
+                    candidate_key(item),
+                    (item.get("id") or "").rstrip("/").split("/")[-1].lower(),
+                    (item.get("doi") or "").rstrip("/").split("/")[-1].lower(),
+                    paper_short_id(item).lower(),
+                }
+                if key in known_keys:
                     return attach_downloaded_pdf(dict(item))
         return None
+
+    def figure_paper_for_id(paper_id: str) -> dict[str, Any]:
+        paper = find_known_paper(paper_id)
+        if paper:
+            return paper
+        raise HTTPException(404, "Paper not found.")
+
+    def figures_for_paper_id(paper_id: str) -> dict[str, Any]:
+        paper = figure_paper_for_id(paper_id)
+        folder = figure_folder_for_paper(paper)
+        allowed = {".png", ".jpg", ".jpeg", ".jpe", ".jp2", ".bmp", ".tif", ".tiff", ".webp"}
+        files = []
+        if folder.exists():
+            for path in sorted(item for item in folder.iterdir() if item.is_file() and item.suffix.lower() in allowed):
+                files.append({
+                    "name": path.stem,
+                    "filename": path.name,
+                    "url": f"/api/figure-file/{quote(paper_id, safe='')}/{quote(path.name, safe='')}",
+                    "size": path.stat().st_size,
+                })
+        return {
+            "paper_id": paper_id,
+            "title": str(paper.get("title") or folder.name),
+            "folder": str(folder),
+            "count": len(files),
+            "figures": files,
+        }
+
+    def figure_file_for_paper_id(paper_id: str, filename: str) -> Path:
+        paper = figure_paper_for_id(paper_id)
+        folder = figure_folder_for_paper(paper)
+        target = (folder / filename).resolve()
+        folder_resolved = folder.resolve()
+        if not str(target).startswith(str(folder_resolved)) or not target.exists() or not target.is_file():
+            raise HTTPException(404, "Figure not found.")
+        return target
+
+    def extract_figures_for_repository(repo_id: str) -> dict[str, Any]:
+        if repo_id not in {"all", "repo1", "repo2", "repo3"}:
+            raise HTTPException(400, "Invalid repository.")
+        repositories = load_repositories()
+        selected = repositories.items() if repo_id == "all" else [(repo_id, repositories.get(repo_id) or [])]
+        results: list[dict[str, Any]] = []
+        total_saved = 0
+        total_skipped = 0
+        total_pdfs = 0
+        for current_repo, papers in selected:
+            for paper in papers:
+                paper = attach_downloaded_pdf(dict(paper))
+                pdf_path = Path(str(paper.get("pdf_path") or "")).resolve()
+                if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
+                    continue
+                output_dir = figure_folder_for_paper(paper)
+                try:
+                    result = extract_pdf_figures(pdf_path, output_dir)
+                    total_pdfs += 1
+                    total_saved += int(result["saved"])
+                    total_skipped += int(result["skipped"])
+                    results.append({
+                        "repo_id": current_repo,
+                        "paper_id": paper_short_id(paper),
+                        "title": paper.get("title") or pdf_path.stem,
+                        **result,
+                    })
+                except Exception as exc:
+                    runtime_log.write(f"Figure extraction failed. path={pdf_path}; error={exc!r}", "api")
+                    results.append({
+                        "repo_id": current_repo,
+                        "paper_id": paper_short_id(paper),
+                        "title": paper.get("title") or pdf_path.stem,
+                        "error": str(exc),
+                    })
+        return {
+            "repo_id": repo_id,
+            "pdf_count": total_pdfs,
+            "saved": total_saved,
+            "skipped": total_skipped,
+            "output_root": str(figure_root()),
+            "results": results,
+        }
+
+    def figure_extraction_items(repo_id: str) -> list[tuple[str, dict[str, Any], Path]]:
+        if repo_id not in {"all", "repo1", "repo2", "repo3"}:
+            raise HTTPException(400, "Invalid repository.")
+        repositories = load_repositories()
+        selected = repositories.items() if repo_id == "all" else [(repo_id, repositories.get(repo_id) or [])]
+        items: list[tuple[str, dict[str, Any], Path]] = []
+        for current_repo, papers in selected:
+            for paper in papers:
+                paper = attach_downloaded_pdf(dict(paper))
+                pdf_path = Path(str(paper.get("pdf_path") or "")).resolve()
+                if pdf_path.is_file() and pdf_path.suffix.lower() == ".pdf":
+                    items.append((current_repo, paper, pdf_path))
+        return items
+
+    def run_figure_extraction_job(job: JobState, repo_id: str) -> None:
+        try:
+            items = figure_extraction_items(repo_id)
+            job.status = "extracting_figures"
+            job.total = len(items)
+            job.target = len(items)
+            job.log(f"Figure extraction started: repo={repo_id}; pdfs={len(items)}")
+            output_root = figure_root()
+            total_saved = 0
+            total_skipped = 0
+            if not items:
+                job.status = "finished"
+                job.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+                job.log("Figure extraction finished: no local PDF files found.")
+                return
+            for index, (current_repo, paper, pdf_path) in enumerate(items, start=1):
+                title = str(paper.get("title") or pdf_path.stem)
+                job.log(f"Extracting figures {index}/{len(items)}: {title}")
+                try:
+                    result = extract_pdf_figures(pdf_path, figure_folder_for_paper(paper))
+                    saved = int(result.get("saved") or 0)
+                    skipped = int(result.get("skipped") or 0)
+                    total_saved += saved
+                    total_skipped += skipped
+                    job.downloaded += 1
+                    job.skipped = total_skipped
+                    job.log(f"  saved {saved} images, skipped {skipped}: {pdf_path.name}")
+                except Exception as exc:
+                    job.failed += 1
+                    job.log(f"  figure extraction failed: {title}; {exc}")
+                    runtime_log.write(f"Figure extraction failed. repo={current_repo}; path={pdf_path}; error={exc!r}", "api")
+            job.status = "finished"
+            job.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            job.log(
+                f"Figure extraction finished: pdfs={len(items)}, processed={job.downloaded}, "
+                f"saved={total_saved}, skipped={total_skipped}, failed={job.failed}, output={output_root}"
+            )
+        except Exception as exc:
+            job.status = "error"
+            job.error = str(exc)
+            job.finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            job.log(f"Figure extraction job error: {exc}")
 
     def find_pdf_path_for_paper_id(paper_id: str) -> Path | None:
         key = paper_id.lower()
@@ -618,7 +1091,9 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
                 item_id = str(item.get("id") or "")
                 item_key = candidate_key(item)
                 item_short_id = item_id.rstrip("/").split("/")[-1].lower()
-                if item_short_id == key or item_id.lower() == key or item_key == key:
+                item_doi_short_id = str(item.get("doi") or "").rstrip("/").split("/")[-1].lower()
+                item_figure_id = paper_short_id(item).lower()
+                if key in {item_short_id, item_id.lower(), item_key, item_doi_short_id, item_figure_id}:
                     paper = attach_downloaded_pdf(dict(item))
                     path = Path(paper.get("pdf_path") or "")
                     if path.is_file() and path.suffix.lower() == ".pdf":
@@ -985,6 +1460,7 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
                 )
 
             final = rank_candidates(candidates, request.max_papers)
+            client.enrich_missing_abstracts(final, job.log, limit=min(request.max_papers, 100))
             pdf_paths = downloaded_pdf_map()
             for paper in final:
                 paper["sci_quartile"] = quartiles.lookup(
@@ -1047,6 +1523,7 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
                 )
 
             def finish_title_search(final: list[dict[str, Any]], label: str) -> None:
+                client.enrich_missing_abstracts(final, job.log, limit=min(request.max_papers, 100))
                 pdf_paths = downloaded_pdf_map()
                 for paper in final:
                     paper["sci_quartile"] = quartiles.lookup(
@@ -1829,6 +2306,141 @@ def create_app(root: Path, storage_root: Path | None = None) -> FastAPI:
                 content_disposition_type="inline",
             )
         raise HTTPException(404, "PDF not found.")
+
+    @app.get("/api/figures/{paper_id:path}")
+    def paper_figures(paper_id: str) -> Response:
+        return json_response(figures_for_paper_id(paper_id))
+
+    @app.get("/api/figure-file/{paper_id}/{filename}")
+    def paper_figure_file(paper_id: str, filename: str) -> FileResponse:
+        path = figure_file_for_paper_id(paper_id, unquote(filename))
+        return FileResponse(path, filename=path.name)
+
+    @app.post("/api/extract-figures")
+    async def extract_figures(request: Request) -> dict[str, str]:
+        payload = await request.json()
+        repo_id = str(payload.get("repo_id") or "all")
+        if repo_id not in {"all", "repo1", "repo2", "repo3"}:
+            raise HTTPException(400, "Invalid repository.")
+        job = JobState(str(uuid.uuid4()), "extract_figures")
+        jobs[job.id] = job
+        thread = threading.Thread(target=run_figure_extraction_job, args=(job, repo_id), daemon=True)
+        thread.start()
+        return {"job_id": job.id}
+
+    @app.get("/figure-preview/{paper_id:path}")
+    def figure_preview(paper_id: str, title: str = "图片预览") -> HTMLResponse:
+        result = figures_for_paper_id(paper_id)
+        safe_title = html.escape(title or result.get("title") or "图片预览")
+        figures = result.get("figures") or []
+        if figures:
+            body = "\n".join(
+                f"""
+        <figure class="figure-card">
+          <img src="{html.escape(str(item["url"]))}" alt="{html.escape(str(item["name"]))}" loading="lazy" />
+          <figcaption title="{html.escape(str(item["filename"]))}">{html.escape(str(item["name"]))}</figcaption>
+        </figure>"""
+                for item in figures
+            )
+            content = f'<div class="figure-grid">{body}</div>'
+        else:
+            content = """
+        <div class="empty">
+          <strong>还没有提取到图片</strong>
+          <span>先点击主窗口的“提取图片”，或确认该 PDF 正文中包含可提取图片。</span>
+        </div>"""
+        return HTMLResponse(f"""<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{safe_title}</title>
+    <style>
+      html, body {{
+        min-height: 100%;
+        margin: 0;
+        background: #f6f8fa;
+        color: #18202b;
+        font-family: "Microsoft YaHei UI", "Segoe UI", Arial, sans-serif;
+      }}
+      header {{
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        height: 46px;
+        padding: 0 14px;
+        border-bottom: 1px solid #d8e0e7;
+        background: #ffffff;
+      }}
+      header strong {{
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }}
+      header span {{
+        flex: 0 0 auto;
+        color: #667085;
+        font-size: 12px;
+      }}
+      main {{
+        padding: 14px;
+      }}
+      .figure-grid {{
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        gap: 14px;
+        align-items: start;
+      }}
+      .figure-card {{
+        margin: 0;
+        overflow: hidden;
+        border: 1px solid #d8e0e7;
+        border-radius: 8px;
+        background: #ffffff;
+      }}
+      .figure-card img {{
+        display: block;
+        width: 100%;
+        max-height: 440px;
+        object-fit: contain;
+        background: #ffffff;
+      }}
+      .figure-card figcaption {{
+        padding: 9px 10px;
+        border-top: 1px solid #edf0f3;
+        color: #344054;
+        font-size: 12px;
+        line-height: 1.4;
+        overflow-wrap: anywhere;
+      }}
+      .empty {{
+        min-height: calc(100vh - 74px);
+        display: grid;
+        place-items: center;
+        align-content: center;
+        gap: 6px;
+        color: #667085;
+        text-align: center;
+        line-height: 1.6;
+      }}
+      .empty strong {{
+        color: #253244;
+      }}
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>{safe_title}</strong>
+      <span>{len(figures)} 张图片</span>
+    </header>
+    <main>{content}</main>
+  </body>
+</html>""")
 
     @app.get("/source-preview")
     def source_preview(

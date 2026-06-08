@@ -184,16 +184,17 @@ h2 {
 .repo-row {
   width: 100%;
   display: grid;
-  grid-template-columns: 122px 126px 142px minmax(0, 1fr);
+  grid-template-columns: minmax(86px, 0.8fr) minmax(92px, 0.85fr) minmax(104px, 0.95fr) minmax(0, 3.8fr);
   flex-wrap: nowrap;
   align-items: center;
+  min-height: 34px;
 }
 
 .repo-row .field {
-  height: 36px;
+  height: 34px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .repo-row .field label {
@@ -206,7 +207,7 @@ h2 {
 }
 
 .repo-row .field.small select {
-  width: 64px;
+  width: 50px;
 }
 
 .repo-row .repo-field {
@@ -214,7 +215,7 @@ h2 {
 }
 
 .repo-row .repo-field select {
-  width: 78px;
+  width: 58px;
 }
 
 .repo-row .handoff-field {
@@ -222,23 +223,28 @@ h2 {
 }
 
 .repo-row .handoff-field select {
-  width: 68px;
+  width: 50px;
 }
 
 .repo-actions {
   display: grid;
-  grid-template-columns: 1.1fr 1.1fr 1fr 1fr 1fr;
+  grid-template-columns: 1.08fr 1.08fr 0.72fr 0.82fr 0.82fr 0.54fr;
   flex: 1 1 auto;
+  align-items: center;
   justify-content: stretch;
-  overflow: visible;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .repo-actions button {
   width: 100%;
+  height: 34px;
   min-width: 0;
-  padding: 0 8px;
+  padding: 0 4px;
+  font-size: 13px;
   overflow: hidden;
-  text-overflow: ellipsis;
+  text-overflow: clip;
 }
 
 .status-band {
@@ -427,8 +433,8 @@ button:disabled {
 
 table {
   border-collapse: collapse;
-  width: 1880px;
-  min-width: 1880px;
+  width: 1904px;
+  min-width: 1904px;
   table-layout: fixed;
 }
 
@@ -489,7 +495,7 @@ th:nth-child(9) {
 }
 
 th:nth-child(10) {
-  width: 96px;
+  width: 120px;
 }
 
 th:nth-child(11) {
@@ -619,6 +625,12 @@ td:nth-child(11) {
   padding: 0 8px;
 }
 
+.figure-btn {
+  border-color: #aebbc8;
+  background: #f8fafb;
+  color: #253244;
+}
+
 .relevance-cell {
   display: grid;
   place-items: center;
@@ -704,6 +716,10 @@ td:nth-child(11) {
 
 .project-picker {
   width: 190px;
+}
+
+.abstract-filter-picker {
+  width: 168px;
 }
 
 .journal-filter-picker {
