@@ -369,10 +369,6 @@ function membershipLabel(paper, mode) {
   return repos.length ? repos.join("、") : "未入库";
 }
 
-function isPaperInAnyRepo(paper) {
-  return (state.repoMembership.get(normalizedPaperKey(paper)) || []).length > 0;
-}
-
 function renderPapers(papers, mode = "search") {
   state.mode = mode;
   state.renderSourcePapers = [...papers];
@@ -385,12 +381,9 @@ function renderPapers(papers, mode = "search") {
       const paperKeyValue = escapeAttr(normalizedPaperKey(paper));
       const previewTitle = repoSequenceForPaper(paper, index, mode);
       const pdfCell = pdfCellHtml(paper, paperKeyValue, previewTitle);
-      const alreadyInRepo = mode === "search" && isPaperInAnyRepo(paper);
       const actionCell = mode === "repo"
         ? `<button class="mini danger" data-delete-paper="${paperKeyValue}">删除</button>`
-        : alreadyInRepo
-          ? `<button class="mini add-repo-btn" type="button" disabled>已入库</button>`
-          : `<button class="mini add-repo-btn" type="button" data-add-paper="${paperKeyValue}">加入仓库</button>`;
+        : `<button class="mini add-repo-btn" type="button" data-add-paper="${paperKeyValue}">加入仓库</button>`;
       const relevance = relevancePercent(paper, renderedPapers);
       const relBg = `hsl(151 52% ${Math.max(32, 92 - relevance * 0.5)}%)`;
       const relFg = relevance >= 72 ? "#ffffff" : "#14532d";
@@ -477,6 +470,17 @@ function openRepoPicker(paperKeyValue, anchor, action = "add") {
         ? "全部加入到仓库"
         : "加入到仓库";
   }
+  picker.querySelectorAll("[data-picker-repo]").forEach((button) => {
+    button.disabled = false;
+    button.textContent = repoName(button.dataset.pickerRepo);
+    if (action === "add" && paperKeyValue) {
+      const repoKey = `${button.dataset.pickerRepo}:${paperKeyValue}`;
+      if (state.repoSequences.has(repoKey)) {
+        button.disabled = true;
+        button.textContent = `${repoName(button.dataset.pickerRepo)} 已入库`;
+      }
+    }
+  });
   picker.hidden = false;
   const rect = anchor.getBoundingClientRect();
   const width = 168;
